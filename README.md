@@ -626,7 +626,72 @@ journalctl -u gopay-orchestrator -f
 
 ### Q: Windows 本地能跑吗
 
-`start.sh` 是 Bash 脚本，Windows 用户可以在 WSL 里跑，或直接手动启动两个 Python 进程。
+可以。核心代码是 Python + Node.js，主流程没有强依赖 Linux；原来的 Linux 限制主要在 `start.sh`、`systemd` 自启动示例和 README 命令写法。
+
+推荐两种方式：
+
+1. **WSL 方式**：按 Linux 文档走，最省心。
+2. **原生 Windows 方式**：用 PowerShell 启动，适合本地调试。
+
+Windows 原生准备：
+
+```powershell
+# 1. 安装 Python 3.10+ / Node.js 18+ / Git 后，在项目根目录执行
+Copy-Item config.example.json config.json
+
+# 2. 安装 Python 依赖
+pip install -r requirements.txt
+
+# 3. 仅 whatsapp 模式需要
+cd to_whatsapp
+npm install
+cd ..
+```
+
+启动：
+
+```powershell
+# 如果当前策略不允许运行脚本，可只对本次窗口放开
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+.\start.ps1
+```
+
+健康检查：
+
+```powershell
+Invoke-RestMethod http://localhost:8800/health
+```
+
+手动启动也可以：
+
+```powershell
+# 终端 1：支付核心
+cd plus_gopay_links
+python payment_server.py --config ..\config.json --listen :50051
+
+# 终端 2：编排器
+cd ..
+python orchestrator.py
+```
+
+如果使用 `whatsapp` 模式，Windows 下环境变量写法是：
+
+```powershell
+cd to_whatsapp
+$env:WA_PAIRING_PHONE="62xxxxxxxxxx"
+$env:WA_PROXY_URL="socks5://127.0.0.1:1080"
+$env:WA_GRPC_PORT="50056"
+node index.js
+```
+
+注意点：
+
+- PowerShell 里的 `curl` 可能是 `Invoke-WebRequest` 的别名，建议直接用 `Invoke-RestMethod`，或显式使用 `curl.exe`。
+- `start.ps1` 会把日志写到 `logs/` 目录。
+- `otp_forwarder.py` 依赖 `adb`，Windows 也能用，但需要把 Android Platform Tools 加到 PATH。
+- `systemd` 自启动只适用于 Linux；Windows 如需常驻，可改用“任务计划程序”或 NSSM。
+- `to_whatsapp/wa_relay.py` 里的进程管理偏 Linux，Windows 原生建议直接跑 `to_whatsapp/index.js` 或用 `start.ps1`。
 
 ---
 

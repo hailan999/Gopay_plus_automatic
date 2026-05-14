@@ -704,7 +704,10 @@ class GoPayCharger:
             time.sleep(self.sms_switch_countdown_sec)
 
         url = self.sms_switch_endpoint or "https://gwa.gopayapi.com/v1/linking/user-consent"
-        body = {"reference_id": reference_id, "otp_channel": "sms"}
+        if "resend-otp" in url:
+            body = {"reference_id": reference_id}
+        else:
+            body = {"reference_id": reference_id, "otp_channel": "sms"}
         body.update(self.sms_switch_body_extra)
         try:
             r = self.ext.post(

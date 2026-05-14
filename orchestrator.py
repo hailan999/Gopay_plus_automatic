@@ -32,7 +32,7 @@ import payment_pb2_grpc
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 def load_config():
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
         return json.load(f)
 
 CFG = load_config()
@@ -94,7 +94,12 @@ def _wait_manual_otp(issued_after: int, timeout: int, phone: str = "") -> str:
 
 
 # ─── SMS API 模式：轮询接码平台 ───
-def _wait_sms_api_otp(phone: str, issued_after: int, timeout: int) -> str:
+def _wait_sms_api_otp(
+    phone: str,
+    issued_after: int,
+    timeout: int,
+    activation_id: str = "",
+) -> str:
     """轮询接码平台 API 获取 SMS OTP。
     
     通用实现：轮询 {base_url}/get_sms 接口，提取 6 位数字。
@@ -106,12 +111,18 @@ def _wait_sms_api_otp(phone: str, issued_after: int, timeout: int) -> str:
     
     如果你的平台格式不同，修改下方 url 构造和响应解析即可。
     """
-    import urllib.request, urllib.error
-    
     sms_cfg = OTP_CFG.get("sms_api", {})
     api_key = sms_cfg.get("api_key", "")
     base_url = sms_cfg.get("base_url", "").rstrip("/")
     poll_interval = int(sms_cfg.get("poll_interval_sec", 3))
+    use_proxy = bool(sms_cfg.get("use_proxy", True))
+    proxy_url = (sms_cfg.get("proxy") or CFG.get("proxy") or "").strip()
+    activation_id = activation_id or str(
+        sms_cfg.get("activation_id")
+        or sms_cfg.get("order_id")
+        or sms_cfg.get("id")
+        or ""
+    ).strip()
     
     if not api_key or not base_url:
         log.error("sms_api 配置不完整（缺少 api_key 或 base_url）")
@@ -119,17 +130,47 @@ def _wait_sms_api_otp(phone: str, issued_after: int, timeout: int) -> str:
     
     deadline = time.time() + timeout
     log.info("SMS API: polling for phone=***%s timeout=%ds", phone[-4:], timeout)
+    sess = None
+    try:
+        from curl_cffi import requests as cffi_requests  # type: ignore
+        sess = cffi_requests.Session(impersonate="chrome136")
+        if use_proxy and proxy_url:
+            sess.proxies = {"http": proxy_url, "https": proxy_url}
+            log.info("SMS API: proxy enabled")
+    except Exception as e:
+        log.warning("SMS API: curl_cffi unavailable, falling back to urllib: %s", e)
     
     while time.time() < deadline:
         try:
             # ═══ 构造请求 URL ═══
             # 通用格式（根据你的平台修改）：
-            url = f"{base_url}?action=get_sms&api_key={api_key}&phone={phone}&country=id"
-            
-            # 发请求
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                body = resp.read().decode(errors="replace")
+            base_url_lower = base_url.lower()
+            if "hero-sms" in base_url_lower:
+                if not activation_id:
+                    log.error("SMS API: hero-sms requires activation_id/order_id for getStatus")
+                    return ""
+                url = f"{base_url}/stubs/handler_api.php?api_key={api_key}&action=getStatus&id={activation_id}"
+            elif "herosms" in base_url_lower:
+                url = f"{base_url}/api/get_sms?api_key={api_key}&phone={phone}"
+            else:
+                url = f"{base_url}?action=get_sms&api_key={api_key}&phone={phone}&country=id"
+
+            # 发请求。优先用 curl_cffi，避免部分 Windows/服务端 TLS 握手 EOF。
+            if sess is not None:
+                resp = sess.get(url, headers={"Accept": "application/json"}, timeout=12)
+                if resp.status_code == 404:
+                    time.sleep(poll_interval)
+                    continue
+                if resp.status_code >= 400:
+                    log.warning("SMS API HTTP %d: %s", resp.status_code, resp.text[:160])
+                    time.sleep(poll_interval)
+                    continue
+                body = resp.text
+            else:
+                import urllib.request, urllib.error
+                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read().decode(errors="replace")
             
             # ═══ 解析响应，提取 6 位 OTP ═══
             # 尝试 JSON 解析
@@ -154,13 +195,13 @@ def _wait_sms_api_otp(phone: str, issued_after: int, timeout: int) -> str:
             # 没拿到，等下一轮
             # 常见"还没收到"的响应：WAITING, NO_SMS, empty
             
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                pass  # 还没收到短信，正常
-            else:
-                log.warning("SMS API HTTP %d", e.code)
         except Exception as e:
-            log.warning("SMS API error: %s", e)
+            if e.__class__.__name__ == "HTTPError" and getattr(e, "code", None) == 404:
+                pass  # 还没收到短信，正常
+            elif e.__class__.__name__ == "HTTPError":
+                log.warning("SMS API HTTP %s", getattr(e, "code", "?"))
+            else:
+                log.warning("SMS API error: %s", e)
         
         time.sleep(poll_interval)
     
@@ -213,10 +254,15 @@ def _wait_whatsapp_otp(issued_after: int, timeout: int) -> str:
 
 
 # ─── 统一 OTP 获取入口 ───
-def get_otp(phone: str, issued_after: int, timeout: int) -> str:
+def get_otp(
+    phone: str,
+    issued_after: int,
+    timeout: int,
+    activation_id: str = "",
+) -> str:
     """根据 OTP_MODE 选择对应的获取方式。"""
     if OTP_MODE == "sms_api":
-        return _wait_sms_api_otp(phone, issued_after, timeout)
+        return _wait_sms_api_otp(phone, issued_after, timeout, activation_id=activation_id)
     elif OTP_MODE == "whatsapp":
         return _wait_whatsapp_otp(issued_after, timeout)
     else:
@@ -282,7 +328,12 @@ def call_cancel_gopay(flow_id: str):
 # 订阅流程
 # ═══════════════════════════════════════════════════════════
 
-def run_subscribe(session_token: str, phone: str = "", pin: str = "") -> dict:
+def run_subscribe(
+    session_token: str,
+    phone: str = "",
+    pin: str = "",
+    sms_activation_id: str = "",
+) -> dict:
     """执行全自动订阅。phone/pin 可选，覆盖 config 默认值。"""
     t0 = time.time()
     use_phone = phone or GOPAY_CFG.get("phone_number", "")
@@ -302,7 +353,7 @@ def run_subscribe(session_token: str, phone: str = "", pin: str = "") -> dict:
 
     # Step 2: 获取 OTP（根据模式自动选择）
     log.info("step 2: get OTP (mode=%s, timeout=%ds)", OTP_MODE, OTP_TIMEOUT)
-    otp = get_otp(use_phone, issued_after, OTP_TIMEOUT)
+    otp = get_otp(use_phone, issued_after, OTP_TIMEOUT, activation_id=sms_activation_id)
     if not otp:
         call_cancel_gopay(flow_id)
         return {"ok": False, "error": "otp_timeout",
@@ -382,7 +433,17 @@ class Handler(BaseHTTPRequestHandler):
             # 可选参数：覆盖默认手机号和 PIN
             phone = body.get("phone_number", "").strip()
             pin = body.get("pin", "").strip()
-            result = run_subscribe(token, phone=phone, pin=pin)
+            sms_activation_id = (
+                body.get("sms_activation_id", "")
+                or body.get("activation_id", "")
+                or body.get("sms_order_id", "")
+            ).strip()
+            result = run_subscribe(
+                token,
+                phone=phone,
+                pin=pin,
+                sms_activation_id=sms_activation_id,
+            )
             self._json(200, result)
             return
 
