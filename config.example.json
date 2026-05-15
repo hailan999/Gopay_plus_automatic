@@ -3,6 +3,8 @@
     "country_code": "62",
     "phone_number": "默认手机号（不含国家码）",
     "pin": "统一6位PIN",
+    "get_rp_link": "",
+    "___get_rp_link_hint___": "可选：PIN 设置成功后用模拟器浏览器打开的领 RP/跳转 GoPay 链接",
     "browser_locale": "zh-CN",
     "pin_locale": "id",
     "otp_channel": "whatsapp",

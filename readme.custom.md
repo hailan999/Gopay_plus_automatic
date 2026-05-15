@@ -243,3 +243,90 @@ Get-Content .\logs\orchestrator.err.log -Tail 120
 - HeroSMS API key
 - 代理账号密码
 - `config.json` 完整内容
+
+## 9. ADB 自动注册 GoPay 账号
+
+`gopay_register_adb.py` 是独立的 GoPay 注册脚本。它通过 ADB 操作雷电模拟器里的 GoPay App，按 `gopay-steps/1.png` 到 `19.png` 的页面顺序完成：输入手机号、选择 SMS OTP、填写姓名、设置 6 位 PIN。它不调用 ChatGPT 订阅接口。
+
+PIN 设置成功后，脚本会读取 `config.json` 里的 `gopay.get_rp_link`，用模拟器自带浏览器打开该链接。这个打开方式不是普通输入地址栏，而是直接指定 Android 浏览器组件打开完整 URL，可以避免长链接里的 `&` 被截断。
+
+前提：
+
+- 雷电模拟器已启动
+- GoPay App 已安装
+- 已在 HeroSMS 买好印尼号，并拿到 `activation id`
+- `config.json` 里已有 HeroSMS API key
+- 如需注册后自动打开 RP/红包链接，配置 `gopay.get_rp_link`
+
+相关配置示例：
+
+```json
+{
+  "gopay": {
+    "phone_number": "85836075711",
+    "pin": "123456",
+    "name": "smith",
+    "get_rp_link": "https://app.gopay.co.id/..."
+  }
+}
+```
+
+完整注册：
+
+```powershell
+.\.venv\Scripts\python.exe .\gopay_register_adb.py `
+  --phone-number 85836075711 `
+  --sms-activation-id 378456663 `
+  --pin 123456 `
+  --name smith
+```
+
+也可以把 `phone_number`、`pin`、`name`、`get_rp_link` 放到 `config.json`，命令行只传 activation id：
+
+```powershell
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --sms-activation-id 378456663
+```
+
+常用测试入口：
+
+```powershell
+# 干跑：只连接模拟器、启动 GoPay、截图并识别当前页面，不输入手机号和 PIN
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --dry-run
+
+# 单独测试 HeroSMS 是否已经收到 OTP
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --test-otp --sms-activation-id 378456663
+
+# 测试下一条新 OTP：会跳过 logs\herosms_used_otps.json 里记录过的旧验证码
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --test-next-otp --sms-activation-id 378456663
+
+# 单独测试打开 config 或命令行传入的 RP 链接
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --open-rp-link-only --get-rp-link "https://完整链接"
+
+# 当前手机号已经记录为 PIN 设置完成，但实际没有设置好时，强制重新走 PIN 流程
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --sms-activation-id 378456663 --force-pin-setup
+```
+
+HeroSMS 相关手动操作：
+
+```powershell
+# 请求 HeroSMS 新增一条短信。不会在主流程里自动调用。
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --request-extra-sms --sms-activation-id 378456663
+
+# 调 HeroSMS setStatus status=3。不会在主流程里自动调用。
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --request-retry-status --sms-activation-id 378456663
+```
+
+状态文件和日志：
+
+- `logs\gopay_register_steps\`：每一步截图和页面 XML，失败时优先看这里。
+- `logs\gopay_register_adb.log`：注册脚本日志。
+- `logs\herosms_used_otps.json`：记录已经用过的 OTP，避免二次验证码误用旧码。
+- `logs\gopay_pin_setup.json`：记录哪些手机号已经成功设置 PIN。
+
+说明：
+
+- `--phone-number` 可以填 `858...`、`0858...` 或 `62858...`，脚本会自动转成 GoPay 需要的本地号。
+- 默认 ADB 路径是 `E:\leidian\LDPlayer9\adb.exe`，如果雷电装在别处，用 `--adb-path` 指定。
+- 脚本会自动尝试连接 `127.0.0.1:5555/5557/5559/5561/7555`。
+- 脚本不会自动把 HeroSMS activation 标记完成，也不会自动取消 activation。
+- PowerShell 多行命令里的反引号 `` ` `` 必须放在行尾，后面不能有空格；不确定时可以把命令写成一行。

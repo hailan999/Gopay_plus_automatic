@@ -6,3 +6,4 @@ __pycache__/
 *.log
 wa_session/
 gopay-steps/
+logs/
