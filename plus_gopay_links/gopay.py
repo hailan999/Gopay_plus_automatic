@@ -148,6 +148,7 @@ def _safe_header_summary(headers: Any) -> dict[str, str]:
     for key in (
         "Authorization",
         "Cookie",
+        "Accept-Language",
         "User-Agent",
         "oai-device-id",
         "oai-language",
@@ -233,11 +234,11 @@ def _random_fingerprint_base() -> dict[str, Any]:
         ),
         "sec_ch_ua_platform": '"Windows"',
         "platform": "Win32",
-        "locale": "en-US",
-        "language": "en-US",
-        "accept_language": "en-US,en;q=0.9",
-        "timezone": "Asia/Tokyo",
-        "tz_offset": -540,
+        "locale": "id-ID",
+        "language": "id-ID",
+        "accept_language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "timezone": "Asia/Jakarta",
+        "tz_offset": -420,
         "screen_width": screen_width,
         "screen_height": screen_height,
         "viewport_width": viewport_width,
@@ -393,6 +394,7 @@ class GoPayCharger:
     ):
         self.fingerprint = fingerprint_profile or build_fingerprint_profile()
         self.cs = chatgpt_session
+        self.gopay_cfg = dict(gopay_cfg)
         self.country_code = str(gopay_cfg["country_code"]).lstrip("+")
         self.phone = re.sub(r"\D", "", str(gopay_cfg["phone_number"]))
         self.pin = str(gopay_cfg["pin"])
@@ -417,7 +419,7 @@ class GoPayCharger:
         self.sms_switch_countdown_sec = int(gopay_cfg.get("sms_switch_countdown_sec") or 30)
         self.sms_switch_endpoint = str(gopay_cfg.get("sms_switch_endpoint") or "")
         self.sms_switch_body_extra = dict(gopay_cfg.get("sms_switch_body_extra") or {})
-        self.http_retry_limit = max(1, int(gopay_cfg.get("http_retry_limit") or 3))
+        self.http_retry_limit = max(1, int(gopay_cfg.get("http_retry_limit") or 8))
         self.http_retry_base_sleep_s = max(0.5, float(gopay_cfg.get("http_retry_base_sleep_s") or 2.0))
         self.checkout_timeout_s = max(
             5.0,
@@ -439,7 +441,7 @@ class GoPayCharger:
         self.ext = _new_session(str(self.fingerprint.get("impersonate") or "chrome145"))
         self.ext.headers.update({
             "User-Agent": str(self.fingerprint.get("user_agent") or self.cs.headers.get("User-Agent") or ""),
-            "Accept-Language": str(self.fingerprint.get("accept_language") or "en-US,en;q=0.9"),
+            "Accept-Language": str(self.fingerprint.get("accept_language") or "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"),
             "sec-ch-ua": str(self.fingerprint.get("sec_ch_ua") or ""),
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": str(self.fingerprint.get("sec_ch_ua_platform") or '"Windows"'),
@@ -578,15 +580,15 @@ class GoPayCharger:
         return cs_id
 
     def _stripe_create_pm(self, cs_id: str, stripe_pk: str, billing: dict) -> str:
-        # PM billing 即使 IDR 计划也接受 US 地址（HAR 验证）；空配置时给个有效默认
+        # PM billing 默认贴近 Indonesia/Jakarta 指纹；配置 billing 可覆盖任意字段。
         body = {
             "billing_details[name]": billing.get("name") or "John Doe",
             "billing_details[email]": billing.get("email") or "buyer@example.com",
-            "billing_details[address][country]": billing.get("country") or "US",
-            "billing_details[address][line1]": billing.get("line1") or "3110 Sunset Boulevard",
-            "billing_details[address][city]": billing.get("city") or "Los Angeles",
-            "billing_details[address][postal_code]": billing.get("postal_code") or "90026",
-            "billing_details[address][state]": billing.get("state") or "CA",
+            "billing_details[address][country]": billing.get("country") or "ID",
+            "billing_details[address][line1]": billing.get("line1") or "Jalan Ahmad Yani",
+            "billing_details[address][city]": billing.get("city") or "Metro",
+            "billing_details[address][postal_code]": billing.get("postal_code") or "34151",
+            "billing_details[address][state]": billing.get("state") or "Lampung",
             "type": "gopay",
             "client_attribution_metadata[checkout_session_id]": cs_id,
             "key": stripe_pk,
@@ -607,8 +609,8 @@ class GoPayCharger:
     def _stripe_init(self, cs_id: str, stripe_pk: str) -> dict:
         """Call /payment_pages/{cs}/init and validate this session supports GoPay."""
         body = {
-            "browser_locale": str(self.fingerprint.get("locale") or "en-US"),
-            "browser_timezone": str(self.fingerprint.get("timezone") or "Asia/Tokyo"),
+            "browser_locale": str(self.fingerprint.get("locale") or "id-ID"),
+            "browser_timezone": str(self.fingerprint.get("timezone") or "Asia/Jakarta"),
             "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
             "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
             "elements_session_client[elements_init_source]": "custom_checkout",
@@ -1240,6 +1242,36 @@ class GoPayCharger:
             raise GoPayError(f"validate-pin failed: {r.text[:300]}")
         self.log("[gopay] linking complete")
 
+    def _run_main_transfer_after_link(self) -> None:
+        cfg = dict(self.gopay_cfg.get("main_transfer") or {})
+        enabled = cfg.get("enabled")
+        if not (enabled is True or str(enabled).strip().lower() in {"1", "true", "yes", "y", "on"}):
+            return
+        try:
+            from main_transfer_adb import run_main_transfer
+        except Exception as exc:
+            raise GoPayError(f"main_transfer import failed: {exc}") from exc
+        self.log("[gopay] main_transfer start after linking complete")
+        try:
+            result = run_main_transfer(
+                self.gopay_cfg,
+                country_code=self.country_code,
+                phone_number=self.phone,
+                log=self.log,
+            )
+        except Exception as exc:
+            raise GoPayError(f"main_transfer failed: {exc}") from exc
+        if not result.get("ok"):
+            raise GoPayError(f"main_transfer failed: {result}")
+        if result.get("skipped"):
+            self.log(f"[gopay] main_transfer skipped: {result.get('reason', '')}")
+        else:
+            self.log(
+                "[gopay] main_transfer done "
+                f"recipient=***{str(result.get('recipient') or '')[-4:]} "
+                f"amount=Rp{result.get('amount')}"
+            )
+
     # ───── Step 13: Midtrans charge initiation ─────
 
     def _midtrans_create_charge(self, snap_token: str) -> str:
@@ -1469,6 +1501,7 @@ class GoPayCharger:
         challenge_id, client_id = self._gopay_validate_otp(reference_id, otp)
         pin_token = self._tokenize_pin(challenge_id, client_id, purpose="linking")
         self._gopay_validate_pin(reference_id, pin_token)
+        self._run_main_transfer_after_link()
 
         charge_ref = self._midtrans_create_charge(snap_token)
         self._gopay_payment_validate(charge_ref)
@@ -2028,12 +2061,12 @@ def _build_chatgpt_session(auth_cfg: dict, fingerprint_profile: Optional[dict[st
     s.headers.update({
         "User-Agent": user_agent,
         "Accept": "*/*",
-        "Accept-Language": str(fp.get("accept_language") or "en-US,en;q=0.9"),
+        "Accept-Language": str(fp.get("accept_language") or "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"),
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
         "Content-Type": "application/json",
         "oai-device-id": device_id,
-        "oai-language": str(fp.get("language") or "en-US"),
+        "oai-language": str(fp.get("language") or "id-ID"),
         "sec-ch-ua": str(fp.get("sec_ch_ua") or '"Google Chrome";v="145", "Chromium";v="145", "Not.A/Brand";v="99"'),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": str(fp.get("sec_ch_ua_platform") or '"Windows"'),
@@ -2068,7 +2101,7 @@ def _build_chatgpt_session(auth_cfg: dict, fingerprint_profile: Optional[dict[st
                 headers={
                     "User-Agent": user_agent,
                     "Accept": "application/json",
-                    "Accept-Language": s.headers.get("Accept-Language", "en-US,en;q=0.9"),
+                    "Accept-Language": s.headers.get("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"),
                     "Referer": "https://chatgpt.com/",
                     "Cookie": s.headers["Cookie"],
                 },
@@ -2099,7 +2132,7 @@ def _build_chatgpt_session(auth_cfg: dict, fingerprint_profile: Optional[dict[st
             headers={
                 "User-Agent": user_agent,
                 "Accept": "application/json",
-                "Accept-Language": s.headers.get("Accept-Language", "en-US,en;q=0.9"),
+                "Accept-Language": s.headers.get("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"),
                 "Referer": "https://chatgpt.com/",
                 "Cookie": s.headers["Cookie"],
             },

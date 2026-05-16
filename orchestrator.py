@@ -45,6 +45,18 @@ OTP_CFG = CFG.get("otp", {})
 PAYMENT_ADDR = "127.0.0.1:50051"
 HTTP_PORT = int(ORCH_CFG.get("port", 8800))
 OTP_TIMEOUT = int(ORCH_CFG.get("otp_timeout", 90))
+START_GOPAY_TIMEOUT = int(
+    ORCH_CFG.get(
+        "start_gopay_timeout",
+        GOPAY_CFG.get("start_gopay_timeout", 300),
+    )
+)
+COMPLETE_GOPAY_TIMEOUT = int(
+    ORCH_CFG.get(
+        "complete_gopay_timeout",
+        GOPAY_CFG.get("complete_gopay_timeout", 300),
+    )
+)
 OTP_RESEND_AFTER = int(
     ORCH_CFG.get(
         "otp_resend_after",
@@ -496,7 +508,7 @@ def call_start_gopay(session_token: str, phone: str = "", pin: str = "", proxy_u
         proxy_url=proxy_url,
     )
     try:
-        resp = stub.StartGoPay(req, timeout=120)
+        resp = stub.StartGoPay(req, timeout=START_GOPAY_TIMEOUT)
         return {
             "success": resp.success,
             "error_message": resp.error_message,
@@ -514,7 +526,7 @@ def call_complete_gopay(flow_id: str, otp: str) -> dict:
     stub = payment_pb2_grpc.PaymentServiceStub(channel)
     req = payment_pb2.CompleteGoPayRequest(flow_id=flow_id, otp=otp)
     try:
-        resp = stub.CompleteGoPay(req, timeout=60)
+        resp = stub.CompleteGoPay(req, timeout=COMPLETE_GOPAY_TIMEOUT)
         return {
             "success": resp.success,
             "error_message": resp.error_message,

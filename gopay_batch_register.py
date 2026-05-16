@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -30,6 +31,47 @@ stop_event = threading.Event()
 active_proc_lock = threading.Lock()
 active_procs: dict[int, subprocess.Popen] = {}
 prompt_lock = threading.Lock()
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8-sig") as fh:
+        return json.load(fh)
+
+
+def config_string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def protected_emulators_from_config(cfg: dict) -> dict[str, list[str]]:
+    gopay_cfg = cfg.get("gopay") or {}
+    protected = gopay_cfg.get("protected_emulators") or gopay_cfg.get("protected_emulator") or {}
+    if isinstance(protected, list):
+        return {"names": [], "indexes": [], "devices": config_string_list(protected)}
+    if not isinstance(protected, dict):
+        return {"names": [], "indexes": [], "devices": config_string_list(protected)}
+    return {
+        "names": config_string_list(protected.get("names") or protected.get("name")),
+        "indexes": config_string_list(protected.get("indexes") or protected.get("index")),
+        "devices": config_string_list(
+            protected.get("devices")
+            or protected.get("device")
+            or protected.get("serials")
+            or protected.get("serial")
+        ),
+    }
+
+
+def is_protected_index(args: argparse.Namespace, index: str) -> bool:
+    protected = {str(item).strip() for item in getattr(args, "protected_indexes", []) if str(item).strip()}
+    return str(index or "").strip() in protected
 
 
 class WorkerLogger:
@@ -112,8 +154,11 @@ def terminate_active_register_processes(logger: logging.Logger) -> None:
                 logger.warning("Failed to terminate register subprocess pid=%s: %s", proc.pid, exc)
 
 
-def cleanup_instance(ld: Path, index: str, logger: WorkerLogger) -> None:
+def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.Namespace) -> None:
     if not index:
+        return
+    if is_protected_index(args, index):
+        logger.error("Refusing to stop/remove protected LDPlayer index=%s", index)
         return
     try:
         logger.info("Stopping LDPlayer index=%s", index)
@@ -289,6 +334,9 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
             index = str(result.get("index") or "")
             device = str(result.get("device") or "")
             logger.info("Prepared index=%s device=%s", index, device)
+            if is_protected_index(args, index):
+                logger.error("Prepared protected LDPlayer index=%s; refusing registration", index)
+                return
             if stop_requested(stop_file):
                 logger.warning("Stop requested after prepare; skipping registration")
                 return
@@ -303,7 +351,7 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
                 if confirm_keep_instance(args, index, success, logger):
                     logger.warning("Skipping cleanup for LDPlayer index=%s", index)
                 else:
-                    cleanup_instance(ld, index, logger)
+                    cleanup_instance(ld, index, logger, args)
             elif index:
                 logger.warning("Keeping failed LDPlayer index=%s for debugging", index)
             if args.delay_between_runs > 0:
@@ -333,6 +381,9 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--mt-apk", default=str(DEFAULT_MT_APK))
     parser.add_argument("--gopay-apks", default=str(DEFAULT_GOPAY_APKS))
     parser.add_argument("--instance-prefix", default="gopay-auto")
+    parser.add_argument("--protected-emulator-index", action="append", default=[], help="LDPlayer index that must never be stopped/removed")
+    parser.add_argument("--protected-emulator-name", action="append", default=[], help="LDPlayer name reserved outside batch registrations")
+    parser.add_argument("--protected-device", action="append", default=[], help="ADB serial reserved outside batch registrations")
     parser.add_argument("--width", type=int, default=1080)
     parser.add_argument("--height", type=int, default=1920)
     parser.add_argument("--dpi", type=int, default=480)
@@ -346,6 +397,17 @@ def build_args() -> argparse.Namespace:
         args.runs_per_worker = 0
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    cfg = load_config(Path(args.config))
+    protected_cfg = protected_emulators_from_config(cfg)
+    args.protected_indexes = list(dict.fromkeys(
+        config_string_list(args.protected_emulator_index) + protected_cfg["indexes"]
+    ))
+    args.protected_names = list(dict.fromkeys(
+        config_string_list(args.protected_emulator_name) + protected_cfg["names"]
+    ))
+    args.protected_devices = list(dict.fromkeys(
+        config_string_list(args.protected_device) + protected_cfg["devices"]
+    ))
     return args
 
 

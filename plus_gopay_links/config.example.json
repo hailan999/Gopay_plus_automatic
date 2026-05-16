@@ -8,11 +8,37 @@
     "country_code": "62",
     "phone_number": "",
     "pin": "",
-    "browser_locale": "zh-CN",
+    "browser_locale": "id-ID",
     "pin_locale": "id",
+    "protected_emulators": {
+      "names": ["main-emulator"],
+      "indexes": ["0"],
+      "devices": ["emulator-5554"]
+    },
+    "main_transfer": {
+      "enabled": true,
+      "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+      "device": "",
+      "package": "com.gojek.gopay",
+      "pin": "211314",
+      "amount_min": 150,
+      "amount_max": 300,
+      "timeout_seconds": 180
+    },
     "http_retry_limit": 3,
     "http_retry_base_sleep_s": 2,
     "chatgpt_checkout_timeout_s": 45
+  },
+  "fingerprint": {
+    "locale": "id-ID",
+    "language": "id-ID",
+    "accept_language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "timezone": "Asia/Jakarta",
+    "tz_offset": -420
+  },
+  "billing": {
+    "country": "ID",
+    "postal_code": "34151"
   },
   "proxy": ""
 }

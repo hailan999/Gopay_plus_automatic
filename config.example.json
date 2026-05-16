@@ -32,7 +32,24 @@
       "dpi": 480,
       "open_mt": false
     },
-    "browser_locale": "zh-CN",
+    "protected_emulators": {
+      "___hint___": "永远不能被注册流程使用/关闭/删除的主模拟器；建议同时填 name、index、devices",
+      "names": ["main-emulator"],
+      "indexes": ["0"],
+      "devices": ["emulator-5554"]
+    },
+    "main_transfer": {
+      "enabled": true,
+      "___hint___": "支付 link 完成后，用主模拟器给本次 GoPay 号码转账；device 留空时使用 protected_emulators 的第一个 device/index",
+      "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+      "device": "",
+      "package": "com.gojek.gopay",
+      "pin": "211314",
+      "amount_min": 150,
+      "amount_max": 300,
+      "timeout_seconds": 180
+    },
+    "browser_locale": "id-ID",
     "pin_locale": "id",
     "otp_channel": "whatsapp",
     "___otp_channel_options___": "whatsapp(默认) | sms；选 sms 时脚本会等倒计时后切换为 SMS 发送",
@@ -41,9 +58,20 @@
     "___sms_switch_endpoint_hint___": "留空→用内置默认；若 GoPay 改了接口，抓 HAR 得到准确 URL 填这里",
     "sms_switch_body_extra": {},
     "otp_resend_after": 60,
-    "http_retry_limit": 3,
+    "http_retry_limit": 8,
     "http_retry_base_sleep_s": 2,
     "chatgpt_checkout_timeout_s": 45
+  },
+  "fingerprint": {
+    "locale": "id-ID",
+    "language": "id-ID",
+    "accept_language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "timezone": "Asia/Jakarta",
+    "tz_offset": -420
+  },
+  "billing": {
+    "country": "ID",
+    "postal_code": "34151"
   },
   "proxy": "socks5://127.0.0.1:1080",
   "payment_proxy": "",
@@ -51,6 +79,8 @@
   "orchestrator": {
     "port": 8800,
     "otp_timeout": 90,
+    "start_gopay_timeout": 300,
+    "complete_gopay_timeout": 360,
     "otp_resend_after": 60,
     "___otp_timeout_tip___": "SMS 模式建议设 120+，因为 consent 后会先等 30 秒倒计时再切 SMS，然后还要等接码平台收短信",
     "auth_token": "自定义随机字符串"

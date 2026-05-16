@@ -76,6 +76,29 @@ sms_api
 - `sms_activation_id` 是 `378456663`
 - `phone_number` 填给本项目时通常去掉国家码 `62`，即 `85836075711`
 
+## 3.1 主模拟器转账
+
+支付流程在 GoPay link 完成后、正式扣款前，会按 `gopay.main_transfer` 配置操作主模拟器，给本次支付手机号转一笔 `150-300` 之间的随机金额。转账成功后会直接关闭 GoPay，下一次从主页重新开始。
+
+```json
+"protected_emulators": {
+  "names": ["你的主模拟器名称"],
+  "indexes": ["0"],
+  "devices": ["emulator-5554"]
+},
+"main_transfer": {
+  "enabled": true,
+  "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+  "device": "",
+  "package": "com.gojek.gopay",
+  "pin": "211314",
+  "amount_min": 150,
+  "amount_max": 300
+}
+```
+
+`main_transfer.device` 留空时会使用 `protected_emulators.devices` 的第一个设备；如果只填了主模拟器 index，会按雷电常见规则推导成 `emulator-5554 + index * 2`。
+
 ## 4. 单独测试 HeroSMS 是否能取码
 
 只测试 HeroSMS，不触发 GoPay，也不调用 OpenAI：
@@ -368,6 +391,18 @@ PIN 设置成功后，脚本会读取 `config.json` 里的 `gopay.get_rp_link`�
 ```powershell
 .\.venv\Scripts\python.exe .\gopay_register_adb.py --skip-prepare-emulator
 ```
+
+如果机器上有一个永远不能被注册流程操作的主模拟器，先用雷电多开器或 `ldconsole.exe list2` 找到它的名称/index，再用 `adb devices` 找到它的 ADB serial，然后写到 `config.json`：
+
+```json
+"protected_emulators": {
+  "names": ["你的主模拟器名称"],
+  "indexes": ["0"],
+  "devices": ["emulator-5554"]
+}
+```
+
+注册脚本会跳过这些 ADB device；如果显式传入受保护的 `--device`、`--prepare-index` 或 `--prepare-name`，会直接停止并报错。批量注册清理时如果命中受保护 index，也会跳过关闭和删除。
 
 也可以指定前置模拟器：
 

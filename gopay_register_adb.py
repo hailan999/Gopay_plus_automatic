@@ -44,6 +44,8 @@ NUMBER_USAGE_PATH = LOG_DIR / "gopay_number_usage.json"
 DEVICE_EXCEPTIONS_PATH = LOG_DIR / "gopay_device_exceptions.json"
 UI_DUMP_DEVICE_PATH = "/sdcard/window.xml"
 DEFAULT_WEBUI_DB = Path(r"E:\development\git_projects\Gpt-Agreement-Payment\output\webui.db")
+# Temporary: skip receiving gifts, but still continue to the subscribe step after PIN setup.
+RECEIVE_GIFT_AFTER_PIN = False
 
 CONNECT_PORTS = (5555, 5557, 5559, 5561, 7555)
 GOPAY_PACKAGE_CANDIDATES = (
@@ -202,6 +204,79 @@ def load_config(path: Path) -> dict:
         return {}
     with path.open("r", encoding="utf-8-sig") as fh:
         return json.load(fh)
+
+
+def config_string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def protected_emulators_from_config(gopay_cfg: dict) -> dict[str, list[str]]:
+    protected = gopay_cfg.get("protected_emulators") or gopay_cfg.get("protected_emulator") or {}
+    if isinstance(protected, list):
+        return {"names": [], "indexes": [], "devices": config_string_list(protected)}
+    if not isinstance(protected, dict):
+        return {"names": [], "indexes": [], "devices": config_string_list(protected)}
+    names = config_string_list(protected.get("names") or protected.get("name"))
+    indexes = config_string_list(protected.get("indexes") or protected.get("index"))
+    devices = config_string_list(
+        protected.get("devices")
+        or protected.get("device")
+        or protected.get("serials")
+        or protected.get("serial")
+    )
+    return {"names": names, "indexes": indexes, "devices": devices}
+
+
+def protected_device_serials(args: argparse.Namespace) -> set[str]:
+    devices = {str(item).strip().lower() for item in getattr(args, "protected_devices", []) if str(item).strip()}
+    for index in getattr(args, "protected_indexes", []):
+        text = str(index).strip()
+        if text.isdigit():
+            devices.add(f"emulator-{5554 + int(text) * 2}".lower())
+    return devices
+
+
+def is_protected_device(device: str, protected_devices: set[str]) -> bool:
+    return str(device or "").strip().lower() in protected_devices
+
+
+def filter_protected_devices(
+    devices: list[str],
+    protected_devices: set[str],
+    logger: logging.Logger,
+) -> list[str]:
+    safe = []
+    for device in devices:
+        if is_protected_device(device, protected_devices):
+            logger.warning("Skipping protected ADB device %s", device)
+        else:
+            safe.append(device)
+    return safe
+
+
+def assert_prepare_target_not_protected(args: argparse.Namespace) -> None:
+    protected_indexes = {str(item).strip() for item in getattr(args, "protected_indexes", []) if str(item).strip()}
+    protected_names = {
+        str(item).strip().lower()
+        for item in getattr(args, "protected_names", [])
+        if str(item).strip()
+    }
+    if args.prepare_index and str(args.prepare_index).strip() in protected_indexes:
+        raise RegisterError(
+            f"refusing to prepare protected LDPlayer index={args.prepare_index}; "
+            "remove it from gopay.protected_emulators only if you really want to use it"
+        )
+    if args.prepare_name and str(args.prepare_name).strip().lower() in protected_names:
+        raise RegisterError(
+            f"refusing to prepare protected LDPlayer name={args.prepare_name}; "
+            "choose a different gopay.prepare_emulator.name"
+        )
 
 
 def redact_phone(value: str) -> str:
@@ -1327,6 +1402,7 @@ class GoPayRegisterFlow:
         self.did_phone = False
         self.did_name = False
         self.pin_entries = 0
+        self.pin_otp_submitted = False
         self.pin_success_confirmed = False
         self.step_index = 0
         self.technical_issue_retries = 0
@@ -1461,6 +1537,8 @@ class GoPayRegisterFlow:
             self.log.info("Focus OTP fallback area")
             self.adb.tap_rel(state, 0.14, 0.34)
         self.adb.digits(code)
+        if self.pin_entries > 0:
+            self.pin_otp_submitted = True
         time.sleep(2)
 
     def resend_current_otp(self) -> bool:
@@ -1495,6 +1573,26 @@ class GoPayRegisterFlow:
             return True
         self.log.info("Try again button not found; tapping fallback bottom button")
         self.adb.tap_rel(state, 0.50, 0.92)
+        return True
+
+    def handle_offline_popup(self, state: UiState) -> bool:
+        if not state.contains("You seem to be offline", "Check your internet connection"):
+            return False
+        self.technical_issue_retries += 1
+        limit = max(1, int(getattr(self.args, "technical_issue_retry_limit", 5) or 5))
+        if self.technical_issue_retries > limit:
+            raise RegisterError(f"GoPay offline popup persisted after {limit} retries")
+        self.log.info(
+            "GoPay offline popup detected; tapping Try again %s/%s",
+            self.technical_issue_retries,
+            limit,
+        )
+        if self.tap_text(state, "Try again", "Retry"):
+            time.sleep(3)
+            return True
+        self.log.info("Offline Try again button not found; tapping fallback bottom button")
+        self.adb.tap_rel(state, 0.50, 0.92)
+        time.sleep(3)
         return True
 
     def input_pin(self, state: UiState) -> None:
@@ -1595,11 +1693,16 @@ class GoPayRegisterFlow:
             detail="GoPay registration and PIN setup completed",
         )
         self.log.info("GoPay PIN updated successfully")
-        if self.args.get_rp_link:
+        if self.args.get_rp_link and RECEIVE_GIFT_AFTER_PIN:
             self.log.info("Opening config gopay.get_rp_link in emulator browser")
             self.adb.open_url(self.args.get_rp_link)
             if wait_and_tap_open_gift(self.adb, self.log):
                 self.finish_after_open_gift("Open gift tapped after RP link")
+        elif self.args.get_rp_link:
+            self.log.info("Skipping RP link/open gift; dispatching subscribe after PIN setup")
+            post_subscribe_after_gift(self.args, self.log, wait_response=False)
+        else:
+            post_subscribe_after_gift(self.args, self.log, wait_response=False)
 
     def finish_after_open_gift(self, detail: str = "Open gift tapped") -> None:
         remember_number_usage(
@@ -1614,6 +1717,52 @@ class GoPayRegisterFlow:
 
     def security_score_needs_pin_setup(self, state: UiState) -> bool:
         return state.contains("25%", "1/4 actions completed", "Maximize your security")
+
+    def pin_setup_completed_after_otp(self, state: UiState) -> bool:
+        if self.pin_success_confirmed or not self.pin_otp_submitted or self.pin_entries < 2:
+            return False
+        # After PIN OTP is accepted, GoPay often returns to Account & safety
+        # without showing the "successfully updated" toast. At that point 25% /
+        # 1/4 means the PIN task is done, not that Create PIN should be opened
+        # again. Treat either Manage PIN or the security score landing page as
+        # enough evidence to stop the reset loop.
+        return state.contains("Manage PIN", "25%", "1/4 actions completed", "Account & safety", "Account protection")
+
+    def stop_existing_pin_account(self, state: UiState, detail: str) -> bool:
+        if not state.contains("Manage PIN"):
+            return False
+        phone = self.args.full_phone or self.args.phone_number
+        reason = "phone/account already has GoPay PIN; skip this registration"
+        remember_unusable_number(
+            phone,
+            reason=reason,
+            activation_id=self.args.sms_activation_id,
+            screen=state.text,
+        )
+        remember_number_usage(
+            phone,
+            "phone_already_has_pin",
+            activation_id=self.args.sms_activation_id,
+            name=self.args.name,
+            detail=detail or reason,
+        )
+        self.log.warning("%s; ending current run so batch can continue", reason)
+        self.adb.force_stop_gopay(getattr(self.args, "package", ""))
+        return True
+
+    def handle_security_score_pin_path(self, state: UiState) -> bool:
+        self.log.info("Security score is 25%% / 1/4; checking PIN setup/reset path")
+        if self.tap_row_by_text(state, "Create PIN"):
+            return True
+        if state.contains("Manage PIN"):
+            self.stop_existing_pin_account(state, "Manage PIN visible on security score page")
+            return False
+        if self.tap_text(state, "Strengthen your protection now", "Account & safety"):
+            return True
+        self.log.info("Create PIN / Manage PIN not visible; scrolling security settings")
+        self.adb.shell("input swipe 280 860 280 520 500")
+        time.sleep(1)
+        return True
 
     def match_register_exception(self, state: UiState) -> Optional[dict]:
         for item in REGISTER_EXCEPTIONS:
@@ -1680,6 +1829,9 @@ class GoPayRegisterFlow:
             self.log.info("Current screen: %s", brief)
             self.save_observation(state, classify_state(state))
 
+            if self.handle_offline_popup(state):
+                continue
+
             exception = self.match_register_exception(state)
             if exception:
                 if self.handle_register_exception(exception, state):
@@ -1690,14 +1842,17 @@ class GoPayRegisterFlow:
                 self.finish_after_pin_success()
                 return
 
+            if self.pin_setup_completed_after_otp(state):
+                self.log.info("PIN OTP accepted; Account & safety shows PIN is already set")
+                self.finish_after_pin_success()
+                return
+
+            if self.stop_existing_pin_account(state, "Manage PIN screen detected before PIN setup completion"):
+                return
+
             if self.security_score_needs_pin_setup(state):
-                self.log.info("Security score is 25%% / 1/4; PIN success is not confirmed yet, continuing PIN setup")
-                if self.tap_row_by_text(state, "Create PIN"):
-                    continue
-                if self.tap_text(state, "Strengthen your protection now", "Account & safety"):
-                    continue
-                self.adb.shell("input swipe 280 860 280 520 500")
-                time.sleep(1)
+                if not self.handle_security_score_pin_path(state):
+                    return
                 continue
 
             if self.maybe_start_language_flow(state):
@@ -1742,6 +1897,10 @@ class GoPayRegisterFlow:
                     self.adb.keyevent(4)
                     time.sleep(1)
                     continue
+                if not RECEIVE_GIFT_AFTER_PIN:
+                    self.log.info("Gift page visible after PIN setup; skipping Open gift and dispatching subscribe")
+                    post_subscribe_after_gift(self.args, self.log, wait_response=False)
+                    return
                 if not self.tap_text(state, "Open gift"):
                     self.adb.tap_rel(state, 0.50, 0.95)
                 time.sleep(2)
@@ -1761,7 +1920,9 @@ class GoPayRegisterFlow:
             if state.contains("0/4 actions completed", "Maximize your security"):
                 if self.tap_row_by_text(state, "Create PIN"):
                     continue
-                self.log.info("Create PIN not visible; scrolling protection page")
+                if self.stop_existing_pin_account(state, "Manage PIN visible on protection page"):
+                    return
+                self.log.info("Create PIN / Manage PIN not visible; scrolling protection page")
                 self.adb.shell("input swipe 280 860 280 520 500")
                 time.sleep(1)
                 continue
@@ -1878,6 +2039,7 @@ def prepare_emulator_for_registration(args: argparse.Namespace, logger: logging.
         print_device=False,
         verbose=args.verbose,
     )
+    assert_prepare_target_not_protected(args)
     logger.info(
         "Preparing LDPlayer before registration name=%s index=%s",
         prep_args.name or "<auto>",
@@ -1906,10 +2068,20 @@ def parse_adb_devices(output: str) -> list[str]:
     return devices
 
 
-def connect_device(adb_path: Path, requested: str, logger: logging.Logger) -> str:
+def connect_device(
+    adb_path: Path,
+    requested: str,
+    logger: logging.Logger,
+    protected_devices: Optional[set[str]] = None,
+) -> str:
+    protected_devices = protected_devices or set()
     base = adb_without_device(adb_path, logger)
     if requested:
         logger.info("Using requested ADB device %s", requested)
+        if is_protected_device(requested, protected_devices):
+            raise RegisterError(
+                f"refusing to use protected ADB device {requested}; choose another emulator/device"
+            )
         if ":" in requested:
             base.raw(["connect", requested], timeout=10)
             time.sleep(0.8)
@@ -1922,7 +2094,7 @@ def connect_device(adb_path: Path, requested: str, logger: logging.Logger) -> st
         return requested
 
     out = base.check(["devices"], timeout=15)
-    devices = parse_adb_devices(out)
+    devices = filter_protected_devices(parse_adb_devices(out), protected_devices, logger)
     if devices:
         logger.info("Using connected ADB device %s", devices[0])
         return devices[0]
@@ -1933,7 +2105,7 @@ def connect_device(adb_path: Path, requested: str, logger: logging.Logger) -> st
         base.raw(["connect", target], timeout=10)
         time.sleep(0.8)
         out = base.check(["devices"], timeout=15)
-        devices = parse_adb_devices(out)
+        devices = filter_protected_devices(parse_adb_devices(out), protected_devices, logger)
         if devices:
             logger.info("Connected ADB device %s", devices[0])
             return devices[0]
@@ -2076,6 +2248,9 @@ def build_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--prepare-index", default="", help="LDPlayer instance index for preparation")
     parser.add_argument("--prepare-create", action="store_true", help="Create LDPlayer instance when prepare-name does not exist")
     parser.add_argument("--prepare-unique-name", action="store_true", help="Auto-suffix prepare-name when creating and the name exists")
+    parser.add_argument("--protected-emulator-name", action="append", default=[], help="LDPlayer instance name that registration must never use")
+    parser.add_argument("--protected-emulator-index", action="append", default=[], help="LDPlayer instance index that registration must never use")
+    parser.add_argument("--protected-device", action="append", default=[], help="ADB device serial that registration must never use")
     parser.add_argument("--ld-dir", default="", help=rf"LDPlayer directory; default {DEFAULT_LD_DIR}")
     parser.add_argument("--mt-apk", default="", help=rf"MT Manager APK; default {DEFAULT_MT_APK}")
     parser.add_argument("--gopay-apks", default="", help=rf"GoPay APKS; default {DEFAULT_GOPAY_APKS}")
@@ -2161,6 +2336,16 @@ def enrich_args(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
     ).strip()
     account_claim_cfg = (gopay_cfg.get("account_claim") or {})
     prepare_cfg = (gopay_cfg.get("prepare_emulator") or {})
+    protected_cfg = protected_emulators_from_config(gopay_cfg)
+    args.protected_names = list(dict.fromkeys(
+        config_string_list(args.protected_emulator_name) + protected_cfg["names"]
+    ))
+    args.protected_indexes = list(dict.fromkeys(
+        config_string_list(args.protected_emulator_index) + protected_cfg["indexes"]
+    ))
+    args.protected_devices = list(dict.fromkeys(
+        config_string_list(args.protected_device) + protected_cfg["devices"]
+    ))
     args.prepare_emulator = bool(args.prepare_emulator or prepare_cfg.get("enabled", True))
     args.prepare_name = (
         args.prepare_name or str(prepare_cfg.get("name") or "gopay-auto-1")
@@ -2278,7 +2463,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.device = prepared_device
             if not args.get_rp_link:
                 raise RegisterError("get_rp_link is empty; set config.json gopay.get_rp_link or pass --get-rp-link")
-            device = connect_device(adb_path, args.device, log)
+            device = connect_device(adb_path, args.device, log, protected_device_serials(args))
             adb = Adb(adb_path, device, log)
             log.info("Opening get_rp_link in emulator browser")
             adb.open_url(args.get_rp_link)
@@ -2307,16 +2492,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "PIN setup already recorded for phone=%s; skipping Profile/PIN steps",
                 redact_phone(args.full_phone),
             )
-            if args.get_rp_link:
+            if args.get_rp_link and RECEIVE_GIFT_AFTER_PIN:
                 if should_prepare_emulator(args):
                     prepared_device = prepare_emulator_for_registration(args, log)
                     args.device = prepared_device
-                device = connect_device(adb_path, args.device, log)
+                device = connect_device(adb_path, args.device, log, protected_device_serials(args))
                 adb = Adb(adb_path, device, log)
                 log.info("Opening get_rp_link in emulator browser")
                 adb.open_url(args.get_rp_link)
                 if wait_and_tap_open_gift(adb, log):
                     post_subscribe_after_gift(args, log, wait_response=False)
+            elif args.get_rp_link:
+                log.info("Skipping RP link/open gift; dispatching subscribe because PIN is already recorded")
+                post_subscribe_after_gift(args, log, wait_response=False)
+            else:
+                post_subscribe_after_gift(args, log, wait_response=False)
             return 0
 
         sms = None
@@ -2356,7 +2546,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             prepared_device = prepare_emulator_for_registration(args, log)
             args.device = prepared_device
 
-        device = connect_device(adb_path, args.device, log)
+        device = connect_device(adb_path, args.device, log, protected_device_serials(args))
         adb = Adb(adb_path, device, log)
 
         if args.input_test:
