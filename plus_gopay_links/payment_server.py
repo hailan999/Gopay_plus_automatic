@@ -76,11 +76,29 @@ def _redact_phone(value: str) -> str:
     return f"***{digits[-4:]} len={len(digits)}"
 
 
+def _new_request_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _req_prefix(request_id: str) -> str:
+    return f"[req={request_id}] " if request_id else ""
+
+
+def _req_log(request_id: str):
+    prefix = _req_prefix(request_id)
+
+    def _log(message: str, *args) -> None:
+        logger.info("%s%s", prefix, message % args if args else message)
+
+    return _log
+
+
 @dataclass
 class PendingFlow:
     charger: GoPayCharger
     state: dict[str, Any]
     expires_at: float
+    request_id: str = ""
 
     def close(self) -> None:
         self.charger.close()
@@ -95,11 +113,16 @@ class FlowStore:
         self._reaper = threading.Thread(target=self._reap_loop, name="payment-flow-reaper", daemon=True)
         self._reaper.start()
 
-    def put(self, charger: GoPayCharger, state: dict[str, Any]) -> tuple[str, int]:
+    def put(self, charger: GoPayCharger, state: dict[str, Any], request_id: str = "") -> tuple[str, int]:
         flow_id = uuid.uuid4().hex
         expires_at = time.time() + self._ttl_seconds
         with self._lock:
-            self._flows[flow_id] = PendingFlow(charger=charger, state=state, expires_at=expires_at)
+            self._flows[flow_id] = PendingFlow(
+                charger=charger,
+                state=state,
+                expires_at=expires_at,
+                request_id=request_id,
+            )
         return flow_id, int(expires_at)
 
     def pop(self, flow_id: str) -> PendingFlow | None:
@@ -148,9 +171,12 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
 
         charger = None
         cs_session = None
+        request_id = _new_request_id()
+        req_log = _req_log(request_id)
         try:
-            logger.info(
-                "[payment] StartGoPay request country=%s phone=%s pin=%s proxy=%s token_len=%s",
+            req_log(
+                "[payment] StartGoPay request req=%s country=%s phone=%s pin=%s proxy=%s token_len=%s",
+                request_id,
                 request.country_code or "<empty>",
                 _redact_phone(request.phone_number),
                 "yes" if request.pin else "no",
@@ -188,7 +214,7 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 auth_cfg["prefer_session_refresh"] = bool(
                     auth_payload.get("prefer_session_refresh", True)
                 )
-                logger.info(
+                req_log(
                     "[payment] auth payload account_id=%s email=%s session=%s access=%s device=%s",
                     auth_payload.get("account_id", ""),
                     auth_payload.get("email", ""),
@@ -208,7 +234,7 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 auth_cfg["prefer_session_refresh"] = auth_cfg.get("prefer_session_refresh", True)
 
             fingerprint_profile = build_fingerprint_profile(cfg.get("fingerprint") or {})
-            logger.info("[payment] fingerprint profile %s", _fingerprint_log_summary(fingerprint_profile))
+            req_log("[payment] fingerprint profile %s", _fingerprint_log_summary(fingerprint_profile))
             cs_session = _build_chatgpt_session(auth_cfg, fingerprint_profile=fingerprint_profile)
 
             gopay_cfg = dict(cfg.get("gopay") or {})
@@ -230,8 +256,8 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 (cfg.get("payment_proxy") or "")
                 or ((cfg.get("gopay") or {}).get("payment_proxy") or "")
             ).strip() or None
-            logger.info("[payment] proxy %s", _mask_proxy_url(proxy or ""))
-            logger.info("[payment] payment_proxy %s", _mask_proxy_url(payment_proxy or ""))
+            req_log("[payment] proxy %s", _mask_proxy_url(proxy or ""))
+            req_log("[payment] payment_proxy %s", _mask_proxy_url(payment_proxy or ""))
             charger = GoPayCharger(
                 cs_session,
                 gopay_cfg,
@@ -240,15 +266,15 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 payment_proxy=payment_proxy,
                 runtime_cfg=runtime_cfg,
                 fingerprint_profile=fingerprint_profile,
-                log=logger.info,
+                log=req_log,
             )
 
-            logger.info("[payment] StartGoPay start")
+            req_log("[payment] StartGoPay start")
             state = charger.start_until_otp(stripe_pk=stripe_pk, billing=_billing_from_config(cfg))
-            flow_id, expires_at = self._flows.put(charger, state)
+            flow_id, expires_at = self._flows.put(charger, state, request_id=request_id)
             charger = None
             cs_session = None
-            logger.info("[payment] StartGoPay waiting_otp flow=%s", flow_id[:8])
+            req_log("[payment] StartGoPay waiting_otp flow=%s", flow_id[:8])
             return payment_pb2.StartGoPayResponse(
                 success=True,
                 flow_id=flow_id,
@@ -257,10 +283,10 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 expires_at_unix=expires_at,
             )
         except GoPayError as exc:
-            logger.error("[payment] StartGoPay failed: %s", exc)
+            logger.error("%s[payment] StartGoPay failed: %s", _req_prefix(request_id), exc)
             return payment_pb2.StartGoPayResponse(success=False, error_message=str(exc)[:500])
         except Exception as exc:
-            logger.exception("[payment] StartGoPay crashed")
+            logger.exception("%s[payment] StartGoPay crashed", _req_prefix(request_id))
             return payment_pb2.StartGoPayResponse(success=False, error_message=str(exc)[:500])
         finally:
             if charger is not None:
@@ -278,8 +304,10 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
         if flow is None:
             return payment_pb2.GoPayResponse(success=False, error_message="payment flow not found or expired")
 
+        request_id = flow.request_id
+        req_log = _req_log(request_id)
         try:
-            logger.info("[payment] CompleteGoPay flow=%s", request.flow_id[:8])
+            req_log("[payment] CompleteGoPay flow=%s", request.flow_id[:8])
             result = flow.charger.complete_after_otp(flow.state, request.otp)
             state = str(result.get("state") or "")
             success = state == "succeeded"
@@ -290,10 +318,10 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 snap_token=str(result.get("snap_token") or ""),
             )
         except GoPayError as exc:
-            logger.error("[payment] CompleteGoPay failed: %s", exc)
+            logger.error("%s[payment] CompleteGoPay failed: %s", _req_prefix(request_id), exc)
             return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
         except Exception as exc:
-            logger.exception("[payment] CompleteGoPay crashed")
+            logger.exception("%s[payment] CompleteGoPay crashed", _req_prefix(request_id))
             return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
         finally:
             flow.close()
@@ -306,18 +334,20 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
         if flow is None:
             return payment_pb2.GoPayResponse(success=False, error_message="payment flow not found or expired")
 
+        request_id = flow.request_id
+        req_log = _req_log(request_id)
         try:
-            logger.info("[payment] ResendGoPayOtp flow=%s", request.flow_id[:8])
+            req_log("[payment] ResendGoPayOtp flow=%s", request.flow_id[:8])
             flow.charger.resend_linking_otp(flow.state)
             return payment_pb2.GoPayResponse(
                 success=True,
                 snap_token=str(flow.state.get("snap_token") or ""),
             )
         except GoPayError as exc:
-            logger.error("[payment] ResendGoPayOtp failed: %s", exc)
+            logger.error("%s[payment] ResendGoPayOtp failed: %s", _req_prefix(request_id), exc)
             return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
         except Exception as exc:
-            logger.exception("[payment] ResendGoPayOtp crashed")
+            logger.exception("%s[payment] ResendGoPayOtp crashed", _req_prefix(request_id))
             return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
 
     def CancelGoPay(self, request, context):
@@ -326,7 +356,12 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
         flow = self._flows.pop(request.flow_id)
         if flow is not None:
             flow.close()
-        logger.info("[payment] CancelGoPay flow=%s found=%s", request.flow_id[:8], flow is not None)
+        logger.info(
+            "%s[payment] CancelGoPay flow=%s found=%s",
+            _req_prefix(flow.request_id if flow is not None else ""),
+            request.flow_id[:8],
+            flow is not None,
+        )
         return payment_pb2.CancelGoPayResponse(success=True)
 
 

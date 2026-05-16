@@ -19,6 +19,7 @@ import sqlite3
 import sys
 import time
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -576,15 +577,17 @@ def run_subscribe(
     pin: str = "",
     sms_activation_id: str = "",
     proxy_url: str = "",
+    request_id: str = "",
 ) -> dict:
     """执行全自动订阅。phone/pin 可选，覆盖 config 默认值。"""
     t0 = time.time()
     use_phone = phone or GOPAY_CFG.get("phone_number", "")
     use_pin = pin or GOPAY_CFG.get("pin", "")
-    log.info("subscribe start phone=***%s mode=%s", use_phone[-4:], OTP_MODE)
+    prefix = f"[req={request_id}] " if request_id else ""
+    log.info("%ssubscribe start phone=***%s mode=%s", prefix, use_phone[-4:], OTP_MODE)
 
     # Step 1: StartGoPay
-    log.info("step 1: StartGoPay")
+    log.info("%sstep 1: StartGoPay", prefix)
     r1 = call_start_gopay(session_token, phone=use_phone, pin=use_pin, proxy_url=proxy_url)
     if not r1["success"]:
         return {"ok": False, "error": "start_gopay_failed",
@@ -592,14 +595,15 @@ def run_subscribe(
 
     flow_id = r1["flow_id"]
     issued_after = r1["issued_after_unix"]
-    log.info("step 1 done: flow_id=%s", flow_id[:8])
+    log.info("%sstep 1 done: flow_id=%s", prefix, flow_id[:8])
 
     # Step 2: 获取 OTP（根据模式自动选择）
     first_wait = OTP_TIMEOUT
     if OTP_RESEND_AFTER > 0:
         first_wait = min(OTP_TIMEOUT, OTP_RESEND_AFTER)
     log.info(
-        "step 2: get OTP (mode=%s, timeout=%ds, resend_after=%ds, first_wait=%ds)",
+        "%sstep 2: get OTP (mode=%s, timeout=%ds, resend_after=%ds, first_wait=%ds)",
+        prefix,
         OTP_MODE,
         OTP_TIMEOUT,
         OTP_RESEND_AFTER,
@@ -607,36 +611,36 @@ def run_subscribe(
     )
     otp = get_otp(use_phone, issued_after, first_wait, activation_id=sms_activation_id)
     if not otp:
-        log.warning("step 2 no OTP after %ds: requesting one OTP resend", first_wait)
+        log.warning("%sstep 2 no OTP after %ds: requesting one OTP resend", prefix, first_wait)
         if OTP_MODE == "sms_api":
             _request_sms_api_resend(sms_activation_id)
         r2 = call_resend_gopay_otp(flow_id)
         if r2.get("success"):
             issued_after = int(time.time() - 5)
-            log.info("step 2 retry: OTP resend requested, polling again timeout=%ds", OTP_TIMEOUT)
+            log.info("%sstep 2 retry: OTP resend requested, polling again timeout=%ds", prefix, OTP_TIMEOUT)
             otp = get_otp(use_phone, issued_after, OTP_TIMEOUT, activation_id=sms_activation_id)
         else:
-            log.warning("step 2 retry: GoPay OTP resend failed: %s", r2.get("error_message", ""))
+            log.warning("%sstep 2 retry: GoPay OTP resend failed: %s", prefix, r2.get("error_message", ""))
         if not otp:
             call_cancel_gopay(flow_id)
             return {"ok": False, "error": "otp_timeout",
                     "detail": f"timeout waiting for OTP after resend (mode={OTP_MODE})",
                     "elapsed_ms": int((time.time()-t0)*1000)}
 
-    log.info("step 2 done: otp=%s", otp)
+    log.info("%sstep 2 done: otp=%s", prefix, otp)
 
     # Step 3: CompleteGoPay
-    log.info("step 3: CompleteGoPay")
+    log.info("%sstep 3: CompleteGoPay", prefix)
     r3 = call_complete_gopay(flow_id, otp)
     elapsed = int((time.time()-t0)*1000)
 
     if r3["success"]:
-        log.info("subscribe SUCCESS in %dms", elapsed)
-        return {"ok": True, "charge_ref": r3["charge_ref"], "elapsed_ms": elapsed}
+        log.info("%ssubscribe SUCCESS in %dms", prefix, elapsed)
+        return {"ok": True, "charge_ref": r3["charge_ref"], "elapsed_ms": elapsed, "request_id": request_id}
     else:
-        log.error("CompleteGoPay failed: %s", r3["error_message"])
+        log.error("%sCompleteGoPay failed: %s", prefix, r3["error_message"])
         return {"ok": False, "error": "complete_failed",
-                "detail": r3["error_message"], "elapsed_ms": elapsed}
+                "detail": r3["error_message"], "elapsed_ms": elapsed, "request_id": request_id}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -721,6 +725,7 @@ class Handler(BaseHTTPRequestHandler):
                 or auth_payload.get("email", "")
                 or auth_payload.get("account_email", "")
             ).strip()
+            request_id = uuid.uuid4().hex[:8]
             try:
                 result = run_subscribe(
                     token,
@@ -728,13 +733,15 @@ class Handler(BaseHTTPRequestHandler):
                     pin=pin,
                     sms_activation_id=sms_activation_id,
                     proxy_url=proxy_url,
+                    request_id=request_id,
                 )
             except Exception as e:
-                log.exception("subscribe crashed")
+                log.exception("[req=%s] subscribe crashed", request_id)
                 result = {
                     "ok": False,
                     "error": "subscribe_exception",
                     "detail": str(e),
+                    "request_id": request_id,
                 }
             update_registered_account_after_payment(
                 result,

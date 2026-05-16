@@ -93,11 +93,15 @@ sms_api
   "package": "com.gojek.gopay",
   "pin": "211314",
   "amount_min": 150,
-  "amount_max": 300
+  "amount_max": 300,
+  "lock_enabled": true,
+  "lock_wait_timeout_seconds": 600,
+  "lock_stale_seconds": 900
 }
 ```
 
 `main_transfer.device` 留空时会使用 `protected_emulators.devices` 的第一个设备；如果只填了主模拟器 index，会按雷电常见规则推导成 `emulator-5554 + index * 2`。
+主模拟器转账会按 `device` 加文件锁，同一时间只有一个流程能操作该模拟器；等待超时后当前支付会失败，不会继续扣款。
 
 ## 4. 单独测试 HeroSMS 是否能取码
 

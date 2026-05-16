@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import re
 import shlex
@@ -21,6 +22,8 @@ DEFAULT_ADB = Path(r"E:\leidian\LDPlayer9\adb.exe")
 DEFAULT_PACKAGE = "com.gojek.gopay"
 GOPAY_PACKAGE_CANDIDATES = ("com.gojek.gopay", "com.gojek.app", "com.go-jek.ios")
 UI_DUMP_DEVICE_PATH = "/sdcard/window.xml"
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LOCK_DIR = ROOT / "logs" / "main_transfer_locks"
 
 
 class MainTransferError(RuntimeError):
@@ -42,6 +45,91 @@ class CallableLogAdapter:
 
     def debug(self, msg: str, *args) -> None:
         return None
+
+
+class MainTransferDeviceLock:
+    def __init__(
+        self,
+        device: str,
+        enabled: bool,
+        wait_timeout_seconds: int,
+        stale_seconds: int,
+        logger,
+        lock_dir: Path = DEFAULT_LOCK_DIR,
+    ):
+        self.device = str(device or "unknown").strip() or "unknown"
+        self.enabled = enabled
+        self.wait_timeout_seconds = max(0, int(wait_timeout_seconds))
+        self.stale_seconds = max(0, int(stale_seconds))
+        self.logger = logger
+        self.lock_dir = lock_dir
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.device)
+        self.path = self.lock_dir / f"{safe_name}.lock"
+        self.fd: int | None = None
+
+    def __enter__(self):
+        if not self.enabled:
+            self.logger.info("[main-transfer] lock disabled for device=%s", self.device)
+            return self
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + self.wait_timeout_seconds
+        logged_wait = False
+        while True:
+            try:
+                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                payload = f"pid={os.getpid()} device={self.device} acquired_at={int(time.time())}\n"
+                os.write(self.fd, payload.encode("utf-8", errors="replace"))
+                self.logger.info("[main-transfer] acquired lock %s", self.path)
+                return self
+            except FileExistsError:
+                if self._remove_stale_lock():
+                    continue
+                if time.time() >= deadline:
+                    raise MainTransferError(f"main_transfer lock timeout for {self.device}")
+                if not logged_wait:
+                    self.logger.info("[main-transfer] waiting for lock %s", self.path)
+                    logged_wait = True
+                time.sleep(1)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.enabled:
+            return
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            self.path.unlink()
+            self.logger.info("[main-transfer] released lock %s", self.path)
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            self.logger.warning("[main-transfer] failed to release lock %s: %s", self.path, err)
+
+    def _remove_stale_lock(self) -> bool:
+        if self.stale_seconds <= 0:
+            return False
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return True
+        if age < self.stale_seconds:
+            return False
+        try:
+            self.path.unlink()
+            self.logger.warning(
+                "[main-transfer] removed stale lock %s age=%.1fs",
+                self.path,
+                age,
+            )
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as err:
+            self.logger.warning("[main-transfer] failed to remove stale lock %s: %s", self.path, err)
+            return False
 
 
 @dataclass
@@ -454,15 +542,17 @@ class MainGoPayTransferFlow:
 
     def run(self, full_phone: str, amount: int) -> dict:
         self.log.info("[main-transfer] start recipient=***%s amount=Rp%s", full_phone[-4:], amount)
-        self.open_transfer_home()
-        self.choose_gopay_transfer()
-        self.enter_recipient(full_phone)
-        self.verify_and_trust()
-        self.input_amount(amount)
-        self.confirm_transfer()
-        self.enter_pin_and_wait_success()
-        self.adb.force_stop_gopay(self.package)
-        return {"ok": True, "recipient": full_phone, "amount": amount, "device": self.adb.device}
+        try:
+            self.open_transfer_home()
+            self.choose_gopay_transfer()
+            self.enter_recipient(full_phone)
+            self.verify_and_trust()
+            self.input_amount(amount)
+            self.confirm_transfer()
+            self.enter_pin_and_wait_success()
+            return {"ok": True, "recipient": full_phone, "amount": amount, "device": self.adb.device}
+        finally:
+            self.adb.force_stop_gopay(self.package)
 
 
 def run_main_transfer(
@@ -506,7 +596,15 @@ def run_main_transfer(
     flow_cfg["pin"] = pin
     adb = Adb(adb_path, device, logger)
     flow = MainGoPayTransferFlow(adb, flow_cfg, logger)
-    return flow.run(full_phone, amount)
+    lock = MainTransferDeviceLock(
+        device=device,
+        enabled=_as_bool(transfer_cfg.get("lock_enabled"), default=True),
+        wait_timeout_seconds=int(transfer_cfg.get("lock_wait_timeout_seconds") or 600),
+        stale_seconds=int(transfer_cfg.get("lock_stale_seconds") or 900),
+        logger=logger,
+    )
+    with lock:
+        return flow.run(full_phone, amount)
 
 
 def _load_config(path: Path) -> dict:

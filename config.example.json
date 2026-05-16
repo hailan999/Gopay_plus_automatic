@@ -47,7 +47,10 @@
       "pin": "211314",
       "amount_min": 150,
       "amount_max": 300,
-      "timeout_seconds": 180
+      "timeout_seconds": 180,
+      "lock_enabled": true,
+      "lock_wait_timeout_seconds": 600,
+      "lock_stale_seconds": 900
     },
     "browser_locale": "id-ID",
     "pin_locale": "id",
@@ -80,7 +83,7 @@
     "port": 8800,
     "otp_timeout": 90,
     "start_gopay_timeout": 300,
-    "complete_gopay_timeout": 360,
+    "complete_gopay_timeout": 900,
     "otp_resend_after": 60,
     "___otp_timeout_tip___": "SMS 模式建议设 120+，因为 consent 后会先等 30 秒倒计时再切 SMS，然后还要等接码平台收短信",
     "auth_token": "自定义随机字符串"
