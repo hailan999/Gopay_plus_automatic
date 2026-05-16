@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import logging
 import threading
 import time
@@ -23,6 +24,9 @@ from gopay import (
     GoPayError,
     OTPCancelled,
     _build_chatgpt_session,
+    build_fingerprint_profile,
+    _fingerprint_log_summary,
+    _mask_proxy_url,
     _load_cfg,
 )
 
@@ -65,6 +69,13 @@ def _close_session(session: Any) -> None:
             pass
 
 
+def _redact_phone(value: str) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return "<empty>"
+    return f"***{digits[-4:]} len={len(digits)}"
+
+
 @dataclass
 class PendingFlow:
     charger: GoPayCharger
@@ -94,6 +105,10 @@ class FlowStore:
     def pop(self, flow_id: str) -> PendingFlow | None:
         with self._lock:
             return self._flows.pop(flow_id, None)
+
+    def get(self, flow_id: str) -> PendingFlow | None:
+        with self._lock:
+            return self._flows.get(flow_id)
 
     def close(self) -> None:
         self._closed.set()
@@ -134,13 +149,54 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
         charger = None
         cs_session = None
         try:
+            logger.info(
+                "[payment] StartGoPay request country=%s phone=%s pin=%s proxy=%s token_len=%s",
+                request.country_code or "<empty>",
+                _redact_phone(request.phone_number),
+                "yes" if request.pin else "no",
+                _mask_proxy_url(request.proxy_url or ""),
+                len(request.session_token or ""),
+            )
             cfg = copy.deepcopy(self._cfg)
             fresh_checkout = cfg.get("fresh_checkout") or {}
             auth_cfg = dict(fresh_checkout.get("auth") or {})
 
-            # 检测传入的是 JWT access_token 还是 session_token
+            # 兼容老格式：session_token 字段可以是纯 token，也可以是
+            # JSON auth payload，里面带 session_token/access_token/device_id。
             _token = request.session_token.strip()
-            if _token.startswith("eyJ") and _token.count(".") == 2:
+            auth_payload = None
+            if _token.startswith("{"):
+                try:
+                    parsed = json.loads(_token)
+                    if isinstance(parsed, dict):
+                        auth_payload = parsed
+                except Exception:
+                    auth_payload = None
+
+            if auth_payload is not None:
+                for key in (
+                    "session_token",
+                    "access_token",
+                    "device_id",
+                    "cookie_header",
+                    "refresh_token",
+                ):
+                    value = str(auth_payload.get(key) or "").strip()
+                    if value:
+                        auth_cfg[key] = value
+                auth_cfg["mode"] = "access_token"
+                auth_cfg["prefer_session_refresh"] = bool(
+                    auth_payload.get("prefer_session_refresh", True)
+                )
+                logger.info(
+                    "[payment] auth payload account_id=%s email=%s session=%s access=%s device=%s",
+                    auth_payload.get("account_id", ""),
+                    auth_payload.get("email", ""),
+                    "yes" if auth_cfg.get("session_token") else "no",
+                    "yes" if auth_cfg.get("access_token") else "no",
+                    "yes" if auth_cfg.get("device_id") else "no",
+                )
+            elif _token.startswith("eyJ") and _token.count(".") == 2:
                 # JWT access_token：直接用作 Bearer，不需要 session_token cookie
                 auth_cfg["access_token"] = _token
                 auth_cfg.pop("session_token", None)
@@ -149,9 +205,11 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 # session_token cookie
                 auth_cfg["session_token"] = _token
                 auth_cfg.pop("cookie_header", None)
-                auth_cfg.pop("access_token", None)
+                auth_cfg["prefer_session_refresh"] = auth_cfg.get("prefer_session_refresh", True)
 
-            cs_session = _build_chatgpt_session(auth_cfg)
+            fingerprint_profile = build_fingerprint_profile(cfg.get("fingerprint") or {})
+            logger.info("[payment] fingerprint profile %s", _fingerprint_log_summary(fingerprint_profile))
+            cs_session = _build_chatgpt_session(auth_cfg, fingerprint_profile=fingerprint_profile)
 
             gopay_cfg = dict(cfg.get("gopay") or {})
             if request.country_code:
@@ -167,13 +225,21 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 or DEFAULT_STRIPE_PK
             )
             runtime_cfg = dict(cfg.get("runtime") or {})
-            proxy = request.proxy_url or (cfg.get("proxy") or "").strip() or None
+            proxy = request.proxy_url.strip() or (cfg.get("proxy") or "").strip() or None
+            payment_proxy = (
+                (cfg.get("payment_proxy") or "")
+                or ((cfg.get("gopay") or {}).get("payment_proxy") or "")
+            ).strip() or None
+            logger.info("[payment] proxy %s", _mask_proxy_url(proxy or ""))
+            logger.info("[payment] payment_proxy %s", _mask_proxy_url(payment_proxy or ""))
             charger = GoPayCharger(
                 cs_session,
                 gopay_cfg,
                 otp_provider=lambda: (_ for _ in ()).throw(OTPCancelled("external OTP required")),
                 proxy=proxy,
+                payment_proxy=payment_proxy,
                 runtime_cfg=runtime_cfg,
+                fingerprint_profile=fingerprint_profile,
                 log=logger.info,
             )
 
@@ -232,6 +298,28 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
         finally:
             flow.close()
 
+    def ResendGoPayOtp(self, request, context):
+        if not request.flow_id:
+            return payment_pb2.GoPayResponse(success=False, error_message="flow_id is required")
+
+        flow = self._flows.get(request.flow_id)
+        if flow is None:
+            return payment_pb2.GoPayResponse(success=False, error_message="payment flow not found or expired")
+
+        try:
+            logger.info("[payment] ResendGoPayOtp flow=%s", request.flow_id[:8])
+            flow.charger.resend_linking_otp(flow.state)
+            return payment_pb2.GoPayResponse(
+                success=True,
+                snap_token=str(flow.state.get("snap_token") or ""),
+            )
+        except GoPayError as exc:
+            logger.error("[payment] ResendGoPayOtp failed: %s", exc)
+            return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
+        except Exception as exc:
+            logger.exception("[payment] ResendGoPayOtp crashed")
+            return payment_pb2.GoPayResponse(success=False, error_message=str(exc)[:500])
+
     def CancelGoPay(self, request, context):
         if not request.flow_id:
             return payment_pb2.CancelGoPayResponse(success=False, error_message="flow_id is required")
@@ -253,6 +341,17 @@ def serve(config_path: str, listen: str, flow_ttl_seconds: int):
         ],
     )
     payment_pb2_grpc.add_PaymentServiceServicer_to_server(service, server)
+    resend_handler = grpc.method_handlers_generic_handler(
+        "payment.PaymentService",
+        {
+            "ResendGoPayOtp": grpc.unary_unary_rpc_method_handler(
+                service.ResendGoPayOtp,
+                request_deserializer=payment_pb2.CancelGoPayRequest.FromString,
+                response_serializer=payment_pb2.GoPayResponse.SerializeToString,
+            )
+        },
+    )
+    server.add_generic_rpc_handlers((resend_handler,))
     listen_addr = _normalize_listen(listen)
     server.add_insecure_port(listen_addr)
     server.start()
@@ -270,7 +369,7 @@ def main():
     parser = argparse.ArgumentParser(description="GoPay payment gRPC service")
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--listen", default=":50051")
-    parser.add_argument("--flow-ttl", type=int, default=240)
+    parser.add_argument("--flow-ttl", type=int, default=600)
     args = parser.parse_args()
 
     serve(

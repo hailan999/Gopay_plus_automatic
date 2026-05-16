@@ -13,7 +13,9 @@ OTP 模式（config.json → otp.mode）：
 """
 import json
 import logging
+import os
 import re
+import sqlite3
 import sys
 import time
 import threading
@@ -43,6 +45,12 @@ OTP_CFG = CFG.get("otp", {})
 PAYMENT_ADDR = "127.0.0.1:50051"
 HTTP_PORT = int(ORCH_CFG.get("port", 8800))
 OTP_TIMEOUT = int(ORCH_CFG.get("otp_timeout", 90))
+OTP_RESEND_AFTER = int(
+    ORCH_CFG.get(
+        "otp_resend_after",
+        GOPAY_CFG.get("otp_resend_after", 60),
+    )
+)
 AUTH_TOKEN = ORCH_CFG.get("auth_token", "")
 OTP_MODE = OTP_CFG.get("mode", "manual")  # manual | sms_api | whatsapp
 
@@ -56,6 +64,169 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("orchestrator")
+
+
+def _webui_db_path() -> Path:
+    data_dir = os.environ.get("WEBUI_DATA_DIR", "").strip()
+    if data_dir:
+        return Path(data_dir) / "webui.db"
+    configured = (
+        (CFG.get("gopay") or {})
+        .get("account_claim", {})
+        .get("db_path", "")
+    )
+    configured = str(configured or "").strip()
+    if configured:
+        path = Path(configured)
+        return path if path.suffix.lower() == ".db" else path / "webui.db"
+    return Path(__file__).parent / "output" / "webui.db"
+
+
+def _normalize_email(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_session_cookie_value(value: str) -> str:
+    value = str(value or "").strip()
+    if "__Secure-next-auth.session-token=" not in value:
+        return value
+    for raw in value.split(";"):
+        part = raw.strip()
+        if part.startswith("__Secure-next-auth.session-token="):
+            return part.split("=", 1)[1].strip()
+    return value
+
+
+def _parse_auth_payload(value: str) -> dict:
+    value = str(value or "").strip()
+    if not value.startswith("{"):
+        return {}
+    try:
+        data = json.loads(value)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _token_lookup_value(token: str, auth_payload: dict) -> str:
+    for key in ("session_token", "access_token", "cookie_header"):
+        value = str(auth_payload.get(key) or "").strip()
+        if value:
+            return _normalize_session_cookie_value(value)
+    return _normalize_session_cookie_value(token)
+
+
+def _classify_account_status(result: dict, refresh_token: str = "") -> str:
+    text = " ".join(
+        str(result.get(key, ""))
+        for key in ("error", "detail", "message", "status")
+    ).upper()
+    if result.get("ok"):
+        return "SUCCESS" if refresh_token else "UN_OAUTHED"
+    if "ADD_PHONE" in text:
+        return "ADD_PHONE"
+    due_match = re.search(r"\b(?:DUE|AMOUNT_DUE|TOTAL_DUE)\D+(\d+)", text)
+    if (
+        "NO_TRIAL" in text
+        or "NO TRIAL" in text
+        or "DUE NOT 0" in text
+        or "CHECKOUT_AMOUNT_MISMATCH" in text
+        or "COMPUTED INVOICE AMOUNT DOES NOT MATCH" in text
+        or (due_match and int(due_match.group(1)) != 0)
+    ):
+        return "NO_TRIAL"
+    return "FAILED"
+
+
+def _find_registered_account(
+    conn: sqlite3.Connection,
+    *,
+    account_id: str = "",
+    email: str = "",
+    token: str = "",
+) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    if account_id:
+        row = conn.execute(
+            "SELECT id, email, status, refresh_token FROM registered_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        if row:
+            return row
+    email_norm = _normalize_email(email)
+    if email_norm:
+        row = conn.execute(
+            """
+            SELECT id, email, status, refresh_token
+            FROM registered_accounts
+            WHERE lower(email) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if row:
+            return row
+    if token:
+        row = conn.execute(
+            """
+            SELECT id, email, status, refresh_token
+            FROM registered_accounts
+            WHERE session_token = ?
+               OR access_token = ?
+               OR instr(coalesce(cookie_header, ''), ?) > 0
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (token, token, token),
+        ).fetchone()
+        if row:
+            return row
+    return None
+
+
+def update_registered_account_after_payment(
+    result: dict,
+    *,
+    account_id: str = "",
+    email: str = "",
+    token: str = "",
+) -> None:
+    db_path = _webui_db_path()
+    if not db_path.exists():
+        log.info("account status update skipped: db not found at %s", db_path)
+        return
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as conn:
+            conn.row_factory = sqlite3.Row
+            row = _find_registered_account(
+                conn,
+                account_id=account_id,
+                email=email,
+                token=token,
+            )
+            if not row:
+                log.warning("account status update skipped: registered account not found")
+                return
+            current = str(row["status"] or "INITIAL").upper()
+            new_status = _classify_account_status(result, row["refresh_token"] or "")
+            if current == "ADD_PHONE" and new_status in {"SUCCESS", "UN_OAUTHED"}:
+                log.info(
+                    "account status preserved: id=%s email=%s status=ADD_PHONE",
+                    row["id"], row["email"],
+                )
+                return
+            conn.execute(
+                "UPDATE registered_accounts SET status = ? WHERE id = ?",
+                (new_status, row["id"]),
+            )
+            conn.commit()
+            log.info(
+                "account status updated: id=%s email=%s %s -> %s",
+                row["id"], row["email"], current, new_status,
+            )
+    except Exception as e:
+        log.warning("account status update failed: %s", e)
 
 # ═══════════════════════════════════════════════════════════
 # OTP 提供者（三种模式）
@@ -209,6 +380,46 @@ def _wait_sms_api_otp(
     return ""
 
 
+def _request_sms_api_resend(activation_id: str) -> bool:
+    sms_cfg = OTP_CFG.get("sms_api", {})
+    api_key = sms_cfg.get("api_key", "")
+    base_url = sms_cfg.get("base_url", "").rstrip("/")
+    use_proxy = bool(sms_cfg.get("use_proxy", True))
+    proxy_url = (sms_cfg.get("proxy") or CFG.get("proxy") or "").strip()
+    activation_id = str(activation_id or "").strip()
+    if not activation_id:
+        log.info("SMS API: skip setStatus=3 because activation_id is empty")
+        return False
+    if not api_key or not base_url:
+        log.warning("SMS API: skip setStatus=3 because api_key/base_url is missing")
+        return False
+    if "hero-sms" not in base_url.lower():
+        log.info("SMS API: skip setStatus=3 for unsupported provider base_url=%s", base_url)
+        return False
+
+    url = f"{base_url}/stubs/handler_api.php?action=setStatus&id={activation_id}&status=3&api_key={api_key}"
+    try:
+        try:
+            from curl_cffi import requests as cffi_requests  # type: ignore
+            sess = cffi_requests.Session(impersonate="chrome145")
+            if use_proxy and proxy_url:
+                sess.proxies = {"http": proxy_url, "https": proxy_url}
+            resp = sess.get(url, headers={"Accept": "text/plain, */*"}, timeout=12)
+            body = resp.text[:160]
+            ok = resp.status_code < 400
+        except Exception:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"Accept": "text/plain, */*"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                body = resp.read().decode(errors="replace")[:160]
+                ok = 200 <= resp.status < 400
+        log.info("SMS API: setStatus=3 activation=%s ok=%s response=%s", activation_id, ok, body)
+        return ok
+    except Exception as e:
+        log.warning("SMS API: setStatus=3 failed: %s", e)
+        return False
+
+
 # ─── WhatsApp 模式：gRPC 调 to_whatsapp ───
 def _wait_whatsapp_otp(issued_after: int, timeout: int) -> str:
     """通过 gRPC 调用 to_whatsapp 模块的 OtpService.WaitForOtp。"""
@@ -274,7 +485,7 @@ def get_otp(
 # gRPC 调用
 # ═══════════════════════════════════════════════════════════
 
-def call_start_gopay(session_token: str, phone: str = "", pin: str = "") -> dict:
+def call_start_gopay(session_token: str, phone: str = "", pin: str = "", proxy_url: str = "") -> dict:
     channel = grpc.insecure_channel(PAYMENT_ADDR)
     stub = payment_pb2_grpc.PaymentServiceStub(channel)
     req = payment_pb2.StartGoPayRequest(
@@ -282,7 +493,7 @@ def call_start_gopay(session_token: str, phone: str = "", pin: str = "") -> dict
         country_code=GOPAY_CFG.get("country_code", "62"),
         phone_number=phone or GOPAY_CFG.get("phone_number", ""),
         pin=pin or GOPAY_CFG.get("pin", ""),
-        proxy_url=CFG.get("proxy", ""),
+        proxy_url=proxy_url,
     )
     try:
         resp = stub.StartGoPay(req, timeout=120)
@@ -314,6 +525,25 @@ def call_complete_gopay(flow_id: str, otp: str) -> dict:
     finally:
         channel.close()
 
+def call_resend_gopay_otp(flow_id: str) -> dict:
+    channel = grpc.insecure_channel(PAYMENT_ADDR)
+    resend = channel.unary_unary(
+        "/payment.PaymentService/ResendGoPayOtp",
+        request_serializer=payment_pb2.CancelGoPayRequest.SerializeToString,
+        response_deserializer=payment_pb2.GoPayResponse.FromString,
+    )
+    req = payment_pb2.CancelGoPayRequest(flow_id=flow_id)
+    try:
+        resp = resend(req, timeout=30)
+        return {
+            "success": resp.success,
+            "error_message": resp.error_message,
+        }
+    except grpc.RpcError as e:
+        return {"success": False, "error_message": f"gRPC: {e.code()} {e.details()}"}
+    finally:
+        channel.close()
+
 def call_cancel_gopay(flow_id: str):
     try:
         channel = grpc.insecure_channel(PAYMENT_ADDR)
@@ -333,6 +563,7 @@ def run_subscribe(
     phone: str = "",
     pin: str = "",
     sms_activation_id: str = "",
+    proxy_url: str = "",
 ) -> dict:
     """执行全自动订阅。phone/pin 可选，覆盖 config 默认值。"""
     t0 = time.time()
@@ -342,7 +573,7 @@ def run_subscribe(
 
     # Step 1: StartGoPay
     log.info("step 1: StartGoPay")
-    r1 = call_start_gopay(session_token, phone=use_phone, pin=use_pin)
+    r1 = call_start_gopay(session_token, phone=use_phone, pin=use_pin, proxy_url=proxy_url)
     if not r1["success"]:
         return {"ok": False, "error": "start_gopay_failed",
                 "detail": r1["error_message"], "elapsed_ms": int((time.time()-t0)*1000)}
@@ -352,13 +583,33 @@ def run_subscribe(
     log.info("step 1 done: flow_id=%s", flow_id[:8])
 
     # Step 2: 获取 OTP（根据模式自动选择）
-    log.info("step 2: get OTP (mode=%s, timeout=%ds)", OTP_MODE, OTP_TIMEOUT)
-    otp = get_otp(use_phone, issued_after, OTP_TIMEOUT, activation_id=sms_activation_id)
+    first_wait = OTP_TIMEOUT
+    if OTP_RESEND_AFTER > 0:
+        first_wait = min(OTP_TIMEOUT, OTP_RESEND_AFTER)
+    log.info(
+        "step 2: get OTP (mode=%s, timeout=%ds, resend_after=%ds, first_wait=%ds)",
+        OTP_MODE,
+        OTP_TIMEOUT,
+        OTP_RESEND_AFTER,
+        first_wait,
+    )
+    otp = get_otp(use_phone, issued_after, first_wait, activation_id=sms_activation_id)
     if not otp:
-        call_cancel_gopay(flow_id)
-        return {"ok": False, "error": "otp_timeout",
-                "detail": f"timeout waiting for OTP after {OTP_TIMEOUT}s (mode={OTP_MODE})",
-                "elapsed_ms": int((time.time()-t0)*1000)}
+        log.warning("step 2 no OTP after %ds: requesting one OTP resend", first_wait)
+        if OTP_MODE == "sms_api":
+            _request_sms_api_resend(sms_activation_id)
+        r2 = call_resend_gopay_otp(flow_id)
+        if r2.get("success"):
+            issued_after = int(time.time() - 5)
+            log.info("step 2 retry: OTP resend requested, polling again timeout=%ds", OTP_TIMEOUT)
+            otp = get_otp(use_phone, issued_after, OTP_TIMEOUT, activation_id=sms_activation_id)
+        else:
+            log.warning("step 2 retry: GoPay OTP resend failed: %s", r2.get("error_message", ""))
+        if not otp:
+            call_cancel_gopay(flow_id)
+            return {"ok": False, "error": "otp_timeout",
+                    "detail": f"timeout waiting for OTP after resend (mode={OTP_MODE})",
+                    "elapsed_ms": int((time.time()-t0)*1000)}
 
     log.info("step 2 done: otp=%s", otp)
 
@@ -430,6 +681,7 @@ class Handler(BaseHTTPRequestHandler):
             if not token or len(token) < 100:
                 self._json(400, {"ok": False, "error": "bad_token"})
                 return
+            auth_payload = _parse_auth_payload(token)
             # 可选参数：覆盖默认手机号和 PIN
             phone = body.get("phone_number", "").strip()
             pin = body.get("pin", "").strip()
@@ -438,11 +690,45 @@ class Handler(BaseHTTPRequestHandler):
                 or body.get("activation_id", "")
                 or body.get("sms_order_id", "")
             ).strip()
-            result = run_subscribe(
-                token,
-                phone=phone,
-                pin=pin,
-                sms_activation_id=sms_activation_id,
+            proxy_url = (
+                body.get("proxy_url", "")
+                or body.get("proxy_add", "")
+                or ""
+            ).strip()
+            account_id = str(
+                body.get("registered_account_id", "")
+                or body.get("account_id", "")
+                or body.get("id", "")
+                or auth_payload.get("account_id", "")
+                or auth_payload.get("registered_account_id", "")
+                or auth_payload.get("id", "")
+            ).strip()
+            account_email = str(
+                body.get("account_email", "")
+                or body.get("email", "")
+                or auth_payload.get("email", "")
+                or auth_payload.get("account_email", "")
+            ).strip()
+            try:
+                result = run_subscribe(
+                    token,
+                    phone=phone,
+                    pin=pin,
+                    sms_activation_id=sms_activation_id,
+                    proxy_url=proxy_url,
+                )
+            except Exception as e:
+                log.exception("subscribe crashed")
+                result = {
+                    "ok": False,
+                    "error": "subscribe_exception",
+                    "detail": str(e),
+                }
+            update_registered_account_after_payment(
+                result,
+                account_id=account_id,
+                email=account_email,
+                token=_token_lookup_value(token, auth_payload),
             )
             self._json(200, result)
             return

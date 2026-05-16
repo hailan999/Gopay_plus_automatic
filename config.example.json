@@ -3,8 +3,35 @@
     "country_code": "62",
     "phone_number": "默认手机号（不含国家码）",
     "pin": "统一6位PIN",
+    "name": "random",
     "get_rp_link": "",
     "___get_rp_link_hint___": "可选：PIN 设置成功后用模拟器浏览器打开的领 RP/跳转 GoPay 链接",
+    "auto_buy_number": false,
+    "___auto_buy_number_hint___": "设为 true 且未传 phone_number/sms_activation_id 时，注册前自动向 HeroSMS getNumber 买号",
+    "post_gift_subscribe": {
+      "enabled": true,
+      "url": "http://localhost:8800/subscribe",
+      "session_token": "sample",
+      "auth_token": ""
+    },
+    "account_claim": {
+      "db_path": "",
+      "target_email": ""
+    },
+    "prepare_emulator": {
+      "enabled": true,
+      "name": "gopay-auto-1",
+      "index": "",
+      "create": true,
+      "unique_name": true,
+      "ld_dir": "E:\\leidian\\LDPlayer9",
+      "mt_apk": "C:\\Users\\Administrator\\Downloads\\MT2.26.4.apk",
+      "gopay_apks": "C:\\Users\\Administrator\\Downloads\\GoPay_2.7.0.apks",
+      "width": 1080,
+      "height": 1920,
+      "dpi": 480,
+      "open_mt": false
+    },
     "browser_locale": "zh-CN",
     "pin_locale": "id",
     "otp_channel": "whatsapp",
@@ -12,12 +39,19 @@
     "sms_switch_countdown_sec": 30,
     "sms_switch_endpoint": "",
     "___sms_switch_endpoint_hint___": "留空→用内置默认；若 GoPay 改了接口，抓 HAR 得到准确 URL 填这里",
-    "sms_switch_body_extra": {}
+    "sms_switch_body_extra": {},
+    "otp_resend_after": 60,
+    "http_retry_limit": 3,
+    "http_retry_base_sleep_s": 2,
+    "chatgpt_checkout_timeout_s": 45
   },
   "proxy": "socks5://127.0.0.1:1080",
+  "payment_proxy": "",
+  "___payment_proxy_hint___": "可选：拿到 ChatGPT/Stripe checkout 链接后，Stripe/Midtrans/GoPay 后续支付链路改用这个代理；留空则继续使用 proxy",
   "orchestrator": {
     "port": 8800,
     "otp_timeout": 90,
+    "otp_resend_after": 60,
     "___otp_timeout_tip___": "SMS 模式建议设 120+，因为 consent 后会先等 30 秒倒计时再切 SMS，然后还要等接码平台收短信",
     "auth_token": "自定义随机字符串"
   },
@@ -30,9 +64,16 @@
       "api_key": "",
       "base_url": "https://api.herosms.com",
       "country": "id",
-      "service": "gopay",
+      "country_id": "6",
+      "service": "ni",
+      "maxPrice": 0.05,
+      "fixedPrice": "true",
+      "operator": "",
+      "phoneException": "",
       "poll_interval_sec": 3,
-      "poll_timeout_sec": 90
+      "poll_timeout_sec": 90,
+      "http_retry_limit": 3,
+      "http_retry_base_sleep_s": 2
     },
     "whatsapp": {
       "grpc_addr": "127.0.0.1:50056"

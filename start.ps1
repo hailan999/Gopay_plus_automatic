@@ -111,11 +111,37 @@ if (-not $NoStopExisting) {
 
 $logsDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+$redirectLogs = @(
+    "payment_server.out.log",
+    "payment_server.err.log",
+    "orchestrator.out.log",
+    "orchestrator.err.log",
+    "to_whatsapp.out.log",
+    "to_whatsapp.err.log"
+)
+foreach ($logName in $redirectLogs) {
+    $logPath = Join-Path $logsDir $logName
+    if (Test-Path $logPath) {
+        try {
+            Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop
+        } catch {
+            $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            try {
+                Rename-Item -LiteralPath $logPath -NewName "$logName.$stamp.old" -Force -ErrorAction Stop
+            } catch {
+                Write-Host "无法清理旧日志 $logPath：$($_.Exception.Message)"
+            }
+        }
+    }
+}
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $paymentArgs = @(
     "payment_server.py",
     "--config", "$Root/config.json",
-    "--listen", ":50051"
+    "--listen", ":50051",
+    "--flow-ttl", "600"
 )
 Write-Host "-> 启动 plus_gopay_links (gRPC :50051)..."
 $payment = Start-Process `

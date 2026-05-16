@@ -1,13 +1,18 @@
 {
   "auth": {
-    "session_token": ""
+    "session_token": "",
+    "access_token": "",
+    "prefer_session_refresh": true
   },
   "gopay": {
     "country_code": "62",
     "phone_number": "",
     "pin": "",
     "browser_locale": "zh-CN",
-    "pin_locale": "id"
+    "pin_locale": "id",
+    "http_retry_limit": 3,
+    "http_retry_base_sleep_s": 2,
+    "chatgpt_checkout_timeout_s": 45
   },
   "proxy": ""
 }
