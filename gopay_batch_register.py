@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import clash_verge_rotator
 import gopay_prepare_emulator as prep
 
 
@@ -72,6 +73,43 @@ def protected_emulators_from_config(cfg: dict) -> dict[str, list[str]]:
 def is_protected_index(args: argparse.Namespace, index: str) -> bool:
     protected = {str(item).strip() for item in getattr(args, "protected_indexes", []) if str(item).strip()}
     return str(index or "").strip() in protected
+
+
+def start_clash_rotation_thread(cfg: dict, logger: logging.Logger) -> tuple[threading.Thread | None, threading.Event | None]:
+    rotation_cfg = cfg.get("clash_verge_rotation") or {}
+    if not isinstance(rotation_cfg, dict) or not rotation_cfg.get("enabled", False):
+        return None, None
+    rotator_cfg = clash_verge_rotator.RotationConfig(
+        enabled=True,
+        controller=str(rotation_cfg.get("controller") or "http://127.0.0.1:9097").rstrip("/"),
+        secret=str(rotation_cfg.get("secret") or ""),
+        group_name=str(rotation_cfg.get("group_name") or "SDK DNS"),
+        interval_minutes=float(rotation_cfg.get("interval_minutes") or 30),
+        switch_at_start=bool(rotation_cfg.get("switch_at_start", True)),
+        include_keywords=[str(item) for item in rotation_cfg.get("include_keywords") or clash_verge_rotator.DEFAULT_INCLUDE_KEYWORDS],
+        exclude_keywords=[str(item) for item in rotation_cfg.get("exclude_keywords") or clash_verge_rotator.DEFAULT_EXCLUDE_KEYWORDS],
+    )
+    stop = threading.Event()
+    if rotator_cfg.switch_at_start:
+        try:
+            clash_verge_rotator.switch_once(rotator_cfg, logger)
+        except Exception as exc:
+            logger.warning("Clash Verge switch at batch start failed: %s", exc)
+        rotator_cfg.switch_at_start = False
+    thread = threading.Thread(
+        target=clash_verge_rotator.run_loop,
+        args=(rotator_cfg, logger, stop),
+        name="clash-verge-rotator",
+        daemon=True,
+    )
+    logger.info(
+        "Starting Clash Verge rotation group=%s interval=%smin controller=%s",
+        rotator_cfg.group_name,
+        rotator_cfg.interval_minutes,
+        rotator_cfg.controller,
+    )
+    thread.start()
+    return thread, stop
 
 
 class WorkerLogger:
@@ -398,6 +436,7 @@ def build_args() -> argparse.Namespace:
     if args.workers < 1:
         parser.error("--workers must be >= 1")
     cfg = load_config(Path(args.config))
+    args.loaded_config = cfg
     protected_cfg = protected_emulators_from_config(cfg)
     args.protected_indexes = list(dict.fromkeys(
         config_string_list(args.protected_emulator_index) + protected_cfg["indexes"]
@@ -423,6 +462,7 @@ def main() -> int:
         args.stop_file,
     )
     threads: list[threading.Thread] = []
+    rotation_thread, rotation_stop = start_clash_rotation_thread(args.loaded_config, logger)
     try:
         for worker_id in range(1, args.workers + 1):
             t = threading.Thread(target=worker_loop, args=(worker_id, args, logger), name=f"worker-{worker_id:02d}")
@@ -432,14 +472,22 @@ def main() -> int:
                 time.sleep(args.stagger_start)
         for t in threads:
             t.join()
+        if rotation_stop is not None:
+            rotation_stop.set()
+        if rotation_thread is not None:
+            rotation_thread.join(timeout=5)
         logger.info("Batch finished")
         return 0
     except KeyboardInterrupt:
         logger.warning("Interrupted; stopping workers and active register subprocesses")
         stop_event.set()
+        if rotation_stop is not None:
+            rotation_stop.set()
         terminate_active_register_processes(logger)
         for t in threads:
             t.join(timeout=5)
+        if rotation_thread is not None:
+            rotation_thread.join(timeout=5)
         return 130
 
 

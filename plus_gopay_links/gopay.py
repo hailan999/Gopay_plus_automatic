@@ -366,6 +366,10 @@ class GoPayPINRejected(GoPayError):
     pass
 
 
+class MidtransPendingTimeout(GoPayError):
+    pass
+
+
 # ──────────────────────────── core ────────────────────────────────
 
 
@@ -836,9 +840,36 @@ class GoPayCharger:
             raise GoPayError(f"pm-redirects: no midtrans token in Location={loc!r}")
         return m.group(1)
 
+    def _midtrans_status_url(self, snap_token: str) -> str:
+        return f"https://app.midtrans.com/snap/v1/transactions/{snap_token}/status"
+
+    def _log_midtrans_debug_links(
+        self,
+        snap_token: str,
+        *,
+        charge_ref: str = "",
+        extra_urls: Optional[dict[str, str]] = None,
+    ) -> None:
+        if not snap_token:
+            return
+        links: dict[str, str] = {
+            "redirection_url": self._midtrans_redirection_url(snap_token),
+            "status_url": self._midtrans_status_url(snap_token),
+        }
+        if charge_ref:
+            links["charge_ref"] = charge_ref
+        if extra_urls:
+            for key, value in extra_urls.items():
+                value = str(value or "")
+                if value:
+                    links[key] = value
+        for key, value in links.items():
+            self.log(f"[gopay] midtrans debug {key}={value}")
+
     def _midtrans_load_transaction(self, snap_token: str):
         """Seed Midtrans cookies, then load transaction metadata."""
         redirection_url = self._midtrans_redirection_url(snap_token)
+        self._log_midtrans_debug_links(snap_token)
         try:
             landing = self._get(
                 self.ext,
@@ -1226,6 +1257,10 @@ class GoPayCharger:
             # Some flows return the JWT in a wrapper; check for raw redirect URL
             # hash extraction not needed since the JWT is in the body for /nb endpoints
             raise GoPayError(f"pin tokenize: no token in response {r.text[:300]}")
+        self.log(
+            f"[gopay] PIN token accepted purpose={purpose} "
+            f"challenge_id={challenge_id[:8]} token_len={len(token)}"
+        )
         return token
 
     def _gopay_validate_pin(self, reference_id: str, pin_token: str):
@@ -1292,6 +1327,19 @@ class GoPayCharger:
             self.log(f"[gopay] charge response keys={sorted(data.keys())[:20]}")
         except Exception:
             pass
+        charge_urls = {
+            key: str(data.get(key) or "")
+            for key in (
+                "redirect_url",
+                "finish_redirect_url",
+                "finish_200_redirect_url",
+                "gopay_verification_link_url",
+                "deeplink_url",
+                "qr_code_url",
+            )
+            if data.get(key)
+        }
+        self._log_midtrans_debug_links(snap_token, extra_urls=charge_urls)
         # Midtrans charge reference 可能在多处，逐一尝试以抵御响应格式变更
         # 优先级：
         #   1) gopay_verification_link_url 里的 reference= 查询参数（最稳的签名）
@@ -1325,13 +1373,15 @@ class GoPayCharger:
             charge_ref = data.get("transaction_id", "") or data.get("order_id", "") or ""
         if not charge_ref:
             raise GoPayError(f"midtrans charge: no reference found in response: {str(data)[:500]}")
+        self._log_midtrans_debug_links(snap_token, charge_ref=charge_ref)
         self.log(f"[gopay] midtrans charge ref={charge_ref}")
         return charge_ref
 
     def _midtrans_poll_status(self, snap_token: str) -> dict:
         """Poll Snap transaction status until GoPay settlement is visible."""
-        url = f"https://app.midtrans.com/snap/v1/transactions/{snap_token}/status"
+        url = self._midtrans_status_url(snap_token)
         last = ""
+        last_data: dict[str, Any] = {}
         for _ in range(MIDTRANS_STATUS_POLL_LIMIT):
             r = self._get(
                 self.ext,
@@ -1342,6 +1392,7 @@ class GoPayCharger:
             )
             if r.status_code == 200:
                 data = r.json()
+                last_data = data if isinstance(data, dict) else {}
                 status = str(data.get("transaction_status") or "")
                 status_code = str(data.get("status_code") or "")
                 last = f"status={status!r} status_code={status_code!r}"
@@ -1354,7 +1405,10 @@ class GoPayCharger:
                 last = f"http {r.status_code}: {r.text[:120]}"
             time.sleep(2)
         self.log(f"[gopay] midtrans status poll timeout: {last}")
-        return {}
+        if last_data:
+            self._log_midtrans_debug_links(snap_token)
+            raise MidtransPendingTimeout(f"midtrans status did not settle after polling: {last_data}")
+        raise MidtransPendingTimeout(f"midtrans status poll timeout without usable status: {last}")
 
     # ───── Step 14: GoPay charge processing ─────
 
@@ -1388,9 +1442,14 @@ class GoPayCharger:
         if not data.get("success"):
             raise GoPayError(f"payment/confirm failed: {data}")
         ch = data.get("data", {}).get("challenge", {}).get("action", {}).get("value", {})
-        return ch.get("challenge_id", ""), ch.get("client_id", "")
+        challenge_id = ch.get("challenge_id", "") or ""
+        client_id = ch.get("client_id", "") or ""
+        if not challenge_id or not client_id:
+            raise GoPayError(f"payment/confirm missing PIN challenge: {data}")
+        self.log(f"[gopay] payment PIN challenge ready challenge_id={challenge_id[:8]}")
+        return challenge_id, client_id
 
-    def _gopay_payment_process(self, charge_ref: str, pin_token: str):
+    def _gopay_payment_process(self, charge_ref: str, pin_token: str, snap_token: str = ""):
         r = self._post(
             self.ext,
             f"https://gwa.gopayapi.com/v1/payment/process?reference_id={charge_ref}",
@@ -1404,10 +1463,29 @@ class GoPayCharger:
             headers=self._gopay_headers(locale=None),
             timeout=DEFAULT_TIMEOUT,
         )
+        data: dict[str, Any] = {}
+        if str(r.headers.get("content-type", "")).startswith("application/json"):
+            try:
+                data = r.json() or {}
+            except Exception:
+                data = {}
         if r.status_code != 200:
+            redirect_url = str(data.get("redirect_url") or "")
+            if redirect_url:
+                self._log_midtrans_debug_links(
+                    snap_token,
+                    charge_ref=charge_ref,
+                    extra_urls={"payment_process_redirect_url": redirect_url},
+                )
+            else:
+                self._log_midtrans_debug_links(snap_token, charge_ref=charge_ref)
+            self.log(
+                "[gopay] payment/process failed "
+                f"status={r.status_code} body={(getattr(r, 'text', '') or '')[:1200]!r}"
+            )
             raise GoPayError(f"payment/process {r.status_code}: {r.text[:600]}")
-        data = r.json()
         if not data.get("success") or data.get("data", {}).get("next_action") != "payment-success":
+            self._log_midtrans_debug_links(snap_token, charge_ref=charge_ref)
             raise GoPayError(f"payment/process failed: {data}")
         self.log("[gopay] charge settled")
 
@@ -1507,7 +1585,7 @@ class GoPayCharger:
         self._gopay_payment_validate(charge_ref)
         ch2_id, ch2_client = self._gopay_payment_confirm(charge_ref)
         pin_token2 = self._tokenize_pin(ch2_id, ch2_client, purpose="payment")
-        self._gopay_payment_process(charge_ref, pin_token2)
+        self._gopay_payment_process(charge_ref, pin_token2, snap_token)
         midtrans_status = self._midtrans_poll_status(snap_token)
 
         if cs_id:

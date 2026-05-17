@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+import clash_verge_rotator
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
@@ -100,6 +102,10 @@ class RegisterError(RuntimeError):
 
 
 class OtpTimeoutError(RegisterError):
+    pass
+
+
+class OtpNoLongerNeeded(RegisterError):
     pass
 
 
@@ -1237,6 +1243,7 @@ class HeroSmsClient:
         allow_reused: bool = False,
         resend_after_seconds: int = 0,
         on_resend: Optional[Callable[[], bool]] = None,
+        should_stop_waiting: Optional[Callable[[], bool]] = None,
     ) -> str:
         if not activation_id:
             raise RegisterError("sms_activation_id is required when waiting for OTP")
@@ -1266,6 +1273,8 @@ class HeroSmsClient:
 
         self.log.info("Polling HeroSMS activation=%s url=%s", activation_id, safe_url)
         while time.time() < deadline:
+            if should_stop_waiting and should_stop_waiting():
+                raise OtpNoLongerNeeded("OTP wait stopped because the app already completed this step")
             try:
                 body = self._open(url)
             except (urllib.error.URLError, TimeoutError, OSError, RegisterError) as exc:
@@ -1431,7 +1440,7 @@ class GoPayRegisterFlow:
         node = state.find(*labels, exact=True)
         if not node:
             return False
-        self.log.info("Tap '%s' at %s,%s", node.label, node.bounds.cx, node.bounds.cy)
+        self.log.info("Tap exact '%s' at %s,%s", node.label, node.bounds.cx, node.bounds.cy)
         self.adb.tap(node.bounds.cx, node.bounds.cy)
         return True
 
@@ -1492,7 +1501,7 @@ class GoPayRegisterFlow:
         raise RegisterError("Create account button not found after name input")
         self.did_name = True
 
-    def input_otp(self, state: UiState) -> None:
+    def input_otp(self, state: UiState) -> bool:
         if self.args.dry_run:
             self.log.info("Dry run: OTP page detected, not polling or typing OTP")
             raise RegisterError("dry-run stopped at OTP page")
@@ -1518,7 +1527,11 @@ class GoPayRegisterFlow:
                 allow_reused=self.args.allow_reused_otp,
                 resend_after_seconds=resend_after,
                 on_resend=resend_action if resend_after else None,
+                should_stop_waiting=self.stop_pin_otp_wait_if_success if self.pin_entries > 0 else None,
             )
+        except OtpNoLongerNeeded:
+            self.finish_after_pin_success()
+            return True
         except OtpTimeoutError:
             remember_number_usage(
                 self.args.full_phone or self.args.phone_number,
@@ -1540,11 +1553,15 @@ class GoPayRegisterFlow:
         if self.pin_entries > 0:
             self.pin_otp_submitted = True
         time.sleep(2)
+        return False
 
     def resend_current_otp(self) -> bool:
         stage = "PIN OTP" if self.pin_entries > 0 else "registration OTP"
         self.log.info("%s still not received/refreshed; trying GoPay Resend", stage)
         state = self.adb.dump_ui()
+        if self.pin_entries > 0 and self.pin_success_visible(state):
+            self.log.info("PIN success screen is already visible; no resend needed")
+            return False
         node = state.find("Resend")
         if not node:
             self.log.info("Resend button not visible on current OTP screen")
@@ -1564,15 +1581,26 @@ class GoPayRegisterFlow:
         if self.technical_issue_retries > limit:
             raise RegisterError(f"GoPay Technical Issue persisted after {limit} retries")
         self.log.info(
-            "GoPay Technical Issue detected; retrying %s/%s after 5s",
+            "GoPay Technical Issue detected; switching Clash node before retry %s/%s",
             self.technical_issue_retries,
             limit,
         )
-        time.sleep(5)
-        if self.tap_text(state, "Try again", "Retry"):
+        try:
+            rotation_cfg = clash_verge_rotator.load_config(Path(self.args.config))
+            if rotation_cfg.enabled:
+                selected = clash_verge_rotator.switch_once(rotation_cfg, self.log)
+                self.log.info("Clash node switched after Technical Issue: %s", selected)
+            else:
+                self.log.warning("Clash Verge rotation is disabled; Technical Issue retry will not switch node")
+        except Exception as exc:
+            self.log.warning("Clash node switch after Technical Issue failed: %s", exc)
+        self.log.info("Waiting 10s before tapping Try again")
+        time.sleep(10)
+        fresh_state = self.adb.dump_ui()
+        if self.tap_exact_text(fresh_state, "Try again", "Retry"):
             return True
         self.log.info("Try again button not found; tapping fallback bottom button")
-        self.adb.tap_rel(state, 0.50, 0.92)
+        self.adb.tap_rel(fresh_state, 0.50, 0.92)
         return True
 
     def handle_offline_popup(self, state: UiState) -> bool:
@@ -1703,6 +1731,20 @@ class GoPayRegisterFlow:
             post_subscribe_after_gift(self.args, self.log, wait_response=False)
         else:
             post_subscribe_after_gift(self.args, self.log, wait_response=False)
+
+    def pin_success_visible(self, state: UiState) -> bool:
+        return state.contains("You can now use your new PIN") or state.contains_all(
+            "successfully updated",
+            "GoPay PIN",
+        )
+
+    def stop_pin_otp_wait_if_success(self) -> bool:
+        state = self.adb.dump_ui()
+        if self.pin_success_visible(state):
+            self.log.info("PIN success screen appeared while waiting for OTP; continuing to next step")
+            self.tap_text(state, "Got it")
+            return True
+        return False
 
     def finish_after_open_gift(self, detail: str = "Open gift tapped") -> None:
         remember_number_usage(
@@ -1837,7 +1879,7 @@ class GoPayRegisterFlow:
                 if self.handle_register_exception(exception, state):
                     return
 
-            if state.contains("successfully updated your GoPay PIN"):
+            if self.pin_success_visible(state):
                 self.tap_text(state, "Got it")
                 self.finish_after_pin_success()
                 return
@@ -1877,11 +1919,13 @@ class GoPayRegisterFlow:
             if state.contains("Check WhatsApp for OTP"):
                 if self.tap_text(state, "Try another method"):
                     continue
-                self.input_otp(state)
+                if self.input_otp(state):
+                    return
                 continue
 
             if state.contains("Enter OTP sent via SMS", "OTP sent via SMS"):
-                self.input_otp(state)
+                if self.input_otp(state):
+                    return
                 continue
 
             if state.contains("Fill out a few details"):

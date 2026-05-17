@@ -64,6 +64,30 @@ OTP_RESEND_AFTER = int(
         GOPAY_CFG.get("otp_resend_after", 60),
     )
 )
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+ACCOUNT_RETRY_ON_START_400 = _as_bool(
+    ORCH_CFG.get(
+        "account_retry_on_start_400",
+        (GOPAY_CFG.get("account_claim") or {}).get("retry_on_start_400", True),
+    ),
+    default=True,
+)
+ACCOUNT_RETRY_MAX = max(
+    0,
+    int(
+        ORCH_CFG.get(
+            "account_retry_max",
+            (GOPAY_CFG.get("account_claim") or {}).get("retry_max", 1),
+        )
+    ),
+)
 AUTH_TOKEN = ORCH_CFG.get("auth_token", "")
 OTP_MODE = OTP_CFG.get("mode", "manual")  # manual | sms_api | whatsapp
 
@@ -127,6 +151,122 @@ def _token_lookup_value(token: str, auth_payload: dict) -> str:
         if value:
             return _normalize_session_cookie_value(value)
     return _normalize_session_cookie_value(token)
+
+
+def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def _sqlite_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not _sqlite_table_exists(conn, table):
+        return set()
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _registered_account_select_cols(conn: sqlite3.Connection) -> list[str]:
+    wanted = [
+        "id",
+        "email",
+        "ts",
+        "password",
+        "session_token",
+        "access_token",
+        "device_id",
+        "csrf_token",
+        "id_token",
+        "refresh_token",
+        "cookie_header",
+        "proxy_add",
+        "hot_client",
+        "hot_rt",
+        "status",
+        "last_check_at",
+        "last_check_status",
+        "last_check_message",
+    ]
+    cols = _sqlite_columns(conn, "registered_accounts")
+    select_cols = [col for col in wanted if col in cols]
+    if "id" not in select_cols or "email" not in select_cols:
+        raise RuntimeError("registered_accounts missing required id/email columns")
+    return select_cols
+
+
+def _build_claimed_auth_payload(account: dict) -> str:
+    payload = {
+        "mode": "access_token",
+        "prefer_session_refresh": True,
+        "session_token": str(account.get("session_token") or ""),
+        "access_token": str(account.get("access_token") or ""),
+        "device_id": str(account.get("device_id") or ""),
+        "cookie_header": str(account.get("cookie_header") or ""),
+        "refresh_token": str(account.get("refresh_token") or ""),
+        "email": str(account.get("email") or ""),
+        "account_id": account.get("id"),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _claim_initial_registered_account(*, skip_account_ids=None):
+    db_path = _webui_db_path()
+    if not db_path.exists():
+        log.info("account retry skipped: db not found at %s", db_path)
+        return None
+    skip_account_ids = {str(value) for value in (skip_account_ids or set()) if str(value)}
+    with sqlite3.connect(str(db_path), timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        if not _sqlite_table_exists(conn, "registered_accounts"):
+            log.warning("account retry skipped: registered_accounts table not found in %s", db_path)
+            return None
+        select_cols = _registered_account_select_cols(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                f"SELECT {', '.join(select_cols)} FROM registered_accounts ORDER BY id DESC"
+            ).fetchall()
+            for row in rows:
+                data = {key: row[key] for key in row.keys()}
+                account_id = str(data.get("id") or "")
+                if account_id in skip_account_ids:
+                    continue
+                status = str(data.get("status") or "").strip().upper() or "INITIAL"
+                if status != "INITIAL":
+                    continue
+                if not str(data.get("session_token") or "").strip():
+                    continue
+                updated = conn.execute(
+                    "UPDATE registered_accounts SET status = 'PROCESSING' "
+                    "WHERE id = ? "
+                    "AND upper(coalesce(nullif(trim(status), ''), 'INITIAL')) = 'INITIAL'",
+                    (data["id"],),
+                )
+                if updated.rowcount == 0:
+                    continue
+                claimed = conn.execute(
+                    f"SELECT {', '.join(select_cols)} FROM registered_accounts WHERE id = ?",
+                    (data["id"],),
+                ).fetchone()
+                conn.commit()
+                out = {key: claimed[key] for key in claimed.keys()}
+                log.info(
+                    "account retry claimed INITIAL account id=%s email=%s session=%s access=%s",
+                    out.get("id"),
+                    out.get("email"),
+                    "yes" if str(out.get("session_token") or "").strip() else "no",
+                    "yes" if str(out.get("access_token") or "").strip() else "no",
+                )
+                return out
+            conn.commit()
+            log.info("account retry skipped: no INITIAL account with session_token")
+            return None
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _classify_account_status(result: dict, refresh_token: str = "") -> str:
@@ -498,7 +638,13 @@ def get_otp(
 # gRPC 调用
 # ═══════════════════════════════════════════════════════════
 
-def call_start_gopay(session_token: str, phone: str = "", pin: str = "", proxy_url: str = "") -> dict:
+def call_start_gopay(
+    session_token: str,
+    phone: str = "",
+    pin: str = "",
+    proxy_url: str = "",
+    request_id: str = "",
+) -> dict:
     channel = grpc.insecure_channel(PAYMENT_ADDR)
     stub = payment_pb2_grpc.PaymentServiceStub(channel)
     req = payment_pb2.StartGoPayRequest(
@@ -509,7 +655,8 @@ def call_start_gopay(session_token: str, phone: str = "", pin: str = "", proxy_u
         proxy_url=proxy_url,
     )
     try:
-        resp = stub.StartGoPay(req, timeout=START_GOPAY_TIMEOUT)
+        metadata = (("x-request-id", request_id),) if request_id else None
+        resp = stub.StartGoPay(req, timeout=START_GOPAY_TIMEOUT, metadata=metadata)
         return {
             "success": resp.success,
             "error_message": resp.error_message,
@@ -588,7 +735,13 @@ def run_subscribe(
 
     # Step 1: StartGoPay
     log.info("%sstep 1: StartGoPay", prefix)
-    r1 = call_start_gopay(session_token, phone=use_phone, pin=use_pin, proxy_url=proxy_url)
+    r1 = call_start_gopay(
+        session_token,
+        phone=use_phone,
+        pin=use_pin,
+        proxy_url=proxy_url,
+        request_id=request_id,
+    )
     if not r1["success"]:
         return {"ok": False, "error": "start_gopay_failed",
                 "detail": r1["error_message"], "elapsed_ms": int((time.time()-t0)*1000)}
@@ -641,6 +794,106 @@ def run_subscribe(
         log.error("%sCompleteGoPay failed: %s", prefix, r3["error_message"])
         return {"ok": False, "error": "complete_failed",
                 "detail": r3["error_message"], "elapsed_ms": elapsed, "request_id": request_id}
+
+
+def _should_retry_with_initial_account(result: dict) -> bool:
+    if not ACCOUNT_RETRY_ON_START_400 or ACCOUNT_RETRY_MAX <= 0:
+        return False
+    if result.get("ok") or result.get("error") != "start_gopay_failed":
+        return False
+    detail = str(result.get("detail") or "").lower()
+    return (
+        "stripe confirm 400" in detail
+        or "checkout_amount_mismatch" in detail
+        or "computed invoice amount does not match" in detail
+        or "token_invalidated" in detail
+        or "authentication token has been invalidated" in detail
+        or "http error 401" in detail
+        or "http error 403" in detail
+        or "checkout create response status=403" in detail
+    )
+
+
+def run_subscribe_with_account_retry(
+    token: str,
+    *,
+    phone: str = "",
+    pin: str = "",
+    sms_activation_id: str = "",
+    proxy_url: str = "",
+    request_id: str = "",
+    account_id: str = "",
+    account_email: str = "",
+    auth_payload=None,
+) -> dict:
+    auth_payload = auth_payload or {}
+    attempts = []
+    current_token = token
+    current_auth_payload = dict(auth_payload)
+    current_account_id = str(account_id or "").strip()
+    current_account_email = str(account_email or "").strip()
+    skip_ids = {current_account_id} if current_account_id else set()
+
+    for attempt_index in range(ACCOUNT_RETRY_MAX + 1):
+        attempt_request_id = request_id if attempt_index == 0 else f"{request_id}-r{attempt_index}"
+        result = run_subscribe(
+            current_token,
+            phone=phone,
+            pin=pin,
+            sms_activation_id=sms_activation_id,
+            proxy_url=proxy_url,
+            request_id=attempt_request_id,
+        )
+        result["request_id"] = attempt_request_id
+        update_registered_account_after_payment(
+            result,
+            account_id=current_account_id,
+            email=current_account_email,
+            token=_token_lookup_value(current_token, current_auth_payload),
+        )
+        attempts.append({
+            "request_id": attempt_request_id,
+            "account_id": current_account_id,
+            "email": current_account_email,
+            "error": result.get("error", ""),
+            "detail": str(result.get("detail", ""))[:240],
+            "ok": bool(result.get("ok")),
+        })
+        should_retry = _should_retry_with_initial_account(result)
+        if should_retry:
+            log.warning(
+                "[req=%s] start failed with retryable account error; attempt=%s/%s account_id=%s detail=%s",
+                request_id,
+                attempt_index + 1,
+                ACCOUNT_RETRY_MAX + 1,
+                current_account_id or "<unknown>",
+                str(result.get("detail", ""))[:220],
+            )
+        if not should_retry or attempt_index >= ACCOUNT_RETRY_MAX:
+            if len(attempts) > 1:
+                result["attempts"] = attempts
+            return result
+
+        claimed = _claim_initial_registered_account(skip_account_ids=skip_ids)
+        if not claimed:
+            log.warning("[req=%s] account retry wanted but no INITIAL account available", request_id)
+            result["attempts"] = attempts
+            return result
+
+        current_token = _build_claimed_auth_payload(claimed)
+        current_auth_payload = _parse_auth_payload(current_token)
+        current_account_id = str(claimed.get("id") or "")
+        current_account_email = str(claimed.get("email") or "")
+        if current_account_id:
+            skip_ids.add(current_account_id)
+        log.info(
+            "[req=%s] retrying subscribe with INITIAL account id=%s email=%s after start 400",
+            request_id,
+            current_account_id,
+            current_account_email,
+        )
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -727,13 +980,16 @@ class Handler(BaseHTTPRequestHandler):
             ).strip()
             request_id = uuid.uuid4().hex[:8]
             try:
-                result = run_subscribe(
+                result = run_subscribe_with_account_retry(
                     token,
                     phone=phone,
                     pin=pin,
                     sms_activation_id=sms_activation_id,
                     proxy_url=proxy_url,
                     request_id=request_id,
+                    account_id=account_id,
+                    account_email=account_email,
+                    auth_payload=auth_payload,
                 )
             except Exception as e:
                 log.exception("[req=%s] subscribe crashed", request_id)
@@ -743,12 +999,6 @@ class Handler(BaseHTTPRequestHandler):
                     "detail": str(e),
                     "request_id": request_id,
                 }
-            update_registered_account_after_payment(
-                result,
-                account_id=account_id,
-                email=account_email,
-                token=_token_lookup_value(token, auth_payload),
-            )
             self._json(200, result)
             return
 
@@ -758,7 +1008,13 @@ class Handler(BaseHTTPRequestHandler):
         log.info("HTTP %s %s", self.address_string(), fmt % args)
 
 def main():
-    log.info("orchestrator listening on :%d  otp_mode=%s", HTTP_PORT, OTP_MODE)
+    log.info(
+        "orchestrator listening on :%d otp_mode=%s account_retry_on_start_400=%s account_retry_max=%s",
+        HTTP_PORT,
+        OTP_MODE,
+        ACCOUNT_RETRY_ON_START_400,
+        ACCOUNT_RETRY_MAX,
+    )
     server = ThreadedHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     server.serve_forever()
 

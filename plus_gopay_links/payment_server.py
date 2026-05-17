@@ -80,6 +80,17 @@ def _new_request_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _metadata_request_id(context) -> str:
+    try:
+        metadata = dict(context.invocation_metadata() or [])
+    except Exception:
+        return ""
+    value = str(metadata.get("x-request-id") or metadata.get("request-id") or "").strip()
+    if not value:
+        return ""
+    return "".join(ch for ch in value if ch.isalnum() or ch in "_.-")[:48]
+
+
 def _req_prefix(request_id: str) -> str:
     return f"[req={request_id}] " if request_id else ""
 
@@ -171,7 +182,7 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
 
         charger = None
         cs_session = None
-        request_id = _new_request_id()
+        request_id = _metadata_request_id(context) or _new_request_id()
         req_log = _req_log(request_id)
         try:
             req_log(

@@ -11,6 +11,7 @@ import random
 import re
 import shlex
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -23,10 +24,18 @@ DEFAULT_PACKAGE = "com.gojek.gopay"
 GOPAY_PACKAGE_CANDIDATES = ("com.gojek.gopay", "com.gojek.app", "com.go-jek.ios")
 UI_DUMP_DEVICE_PATH = "/sdcard/window.xml"
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import clash_verge_rotator
+
 DEFAULT_LOCK_DIR = ROOT / "logs" / "main_transfer_locks"
 
 
 class MainTransferError(RuntimeError):
+    pass
+
+
+class MainTransferTechnicalIssue(MainTransferError):
     pass
 
 
@@ -394,6 +403,14 @@ class MainGoPayTransferFlow:
         self.adb.tap(node.bounds.cx, node.bounds.cy)
         return True
 
+    def tap_exact_text(self, state: UiState, *labels: str) -> bool:
+        node = state.find(*labels, exact=True)
+        if not node:
+            return False
+        self.log.info("[main-transfer] tap exact %r", node.label)
+        self.adb.tap(node.bounds.cx, node.bounds.cy)
+        return True
+
     def tap_lowest_text(self, state: UiState, *labels: str) -> bool:
         lowered = [label.lower() for label in labels if label]
         matches = [
@@ -497,9 +514,66 @@ class MainGoPayTransferFlow:
             self.adb.tap_rel(state, 0.50, 0.96)
 
     def confirm_transfer(self) -> None:
-        state = self.wait_state(lambda s: s.contains("Transfer amount", "Admin fee", "Free admin fee", "Transfer"), "Review page", timeout=25)
-        self.log.info("[main-transfer] tapping final Transfer button")
-        self.adb.tap_rel(state, 0.82, 0.96)
+        last_text = ""
+        for attempt in range(1, 4):
+            state = self.wait_state(
+                lambda s: s.contains("Transfer amount", "Admin fee", "Free admin fee", "Transfer"),
+                "Review page",
+                timeout=25,
+            )
+            last_text = state.text[:400]
+            if state.contains("Enter your PIN", "6-digit PIN"):
+                return
+            self.log.info("[main-transfer] tapping final Transfer button attempt=%s", attempt)
+            if not self.tap_lowest_text(state, "Transfer"):
+                self.adb.tap_rel(state, 0.50, 0.96)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                state = self.adb.dump_ui()
+                last_text = state.text[:400]
+                if state.contains("Enter your PIN", "6-digit PIN"):
+                    return
+                if self.gopay_error_visible(state):
+                    raise MainTransferError(f"GoPay error after final Transfer tap; screen={last_text!r}")
+                time.sleep(1)
+            self.log.warning("[main-transfer] final Transfer tap did not open PIN page; retrying")
+        raise MainTransferError(f"final Transfer did not open PIN page after retries; screen={last_text!r}")
+
+    def transfer_success_visible(self, state: UiState) -> bool:
+        return state.contains("successful", "success", "Transfer details", "Transaction details", "Share receipt")
+
+    def pin_error_visible(self, state: UiState) -> bool:
+        return state.contains(
+            "wrong PIN",
+            "incorrect PIN",
+            "invalid PIN",
+            "PIN is incorrect",
+            "PIN salah",
+            "too many attempts",
+            "cool down",
+            "try again in",
+        )
+
+    def gopay_error_visible(self, state: UiState) -> bool:
+        return state.contains(
+            "Technical Issue",
+            "technical error",
+            "something went wrong",
+            "try again later",
+            "unable to process",
+            "failed",
+            "insufficient balance",
+            "not enough balance",
+        )
+
+    def technical_issue_visible(self, state: UiState) -> bool:
+        return state.contains("Technical Issue", "technical error", "(C07)")
+
+    def dismiss_technical_issue(self, state: UiState) -> None:
+        if self.tap_exact_text(state, "Try again", "Retry", "Got it", "Dismiss"):
+            return
+        self.log.info("[main-transfer] technical issue button not found; tapping fallback bottom area")
+        self.adb.tap_rel(state, 0.50, 0.90)
 
     def enter_pin_and_wait_success(self) -> None:
         state = self.wait_state(lambda s: s.contains("Enter your PIN", "6-digit PIN"), "PIN page", timeout=25)
@@ -510,13 +584,17 @@ class MainGoPayTransferFlow:
         while time.time() < deadline:
             state = self.adb.dump_ui()
             last_text = state.text[:400]
-            if state.contains("successful", "success", "Transfer details", "Transaction details", "Share receipt"):
+            if self.transfer_success_visible(state):
                 self.log.info("[main-transfer] transfer success screen detected")
                 return
+            if self.pin_error_visible(state):
+                raise MainTransferError(f"transfer PIN rejected or rate-limited; screen={last_text!r}")
+            if self.technical_issue_visible(state):
+                raise MainTransferTechnicalIssue(f"GoPay technical issue after transfer PIN; screen={last_text!r}")
+            if self.gopay_error_visible(state):
+                raise MainTransferError(f"GoPay error after transfer PIN; screen={last_text!r}")
             if not state.contains("Enter your PIN", "6-digit PIN"):
-                self.log.info("[main-transfer] PIN page left; treating transfer as submitted")
-                time.sleep(3)
-                return
+                self.log.info("[main-transfer] PIN page left; waiting for explicit transfer result")
             time.sleep(1)
         raise MainTransferError(f"transfer success not confirmed after PIN; screen={last_text!r}")
 
@@ -543,14 +621,40 @@ class MainGoPayTransferFlow:
     def run(self, full_phone: str, amount: int) -> dict:
         self.log.info("[main-transfer] start recipient=***%s amount=Rp%s", full_phone[-4:], amount)
         try:
-            self.open_transfer_home()
-            self.choose_gopay_transfer()
-            self.enter_recipient(full_phone)
-            self.verify_and_trust()
-            self.input_amount(amount)
-            self.confirm_transfer()
-            self.enter_pin_and_wait_success()
-            return {"ok": True, "recipient": full_phone, "amount": amount, "device": self.adb.device}
+            limit = max(1, int(self.cfg.get("technical_issue_retry_limit") or 5))
+            for attempt in range(1, limit + 1):
+                try:
+                    self.open_transfer_home()
+                    self.choose_gopay_transfer()
+                    self.enter_recipient(full_phone)
+                    self.verify_and_trust()
+                    self.input_amount(amount)
+                    self.confirm_transfer()
+                    self.enter_pin_and_wait_success()
+                    return {"ok": True, "recipient": full_phone, "amount": amount, "device": self.adb.device}
+                except MainTransferTechnicalIssue as exc:
+                    if attempt >= limit:
+                        raise MainTransferError(f"GoPay Technical Issue persisted after {limit} main-transfer retries: {exc}") from exc
+                    self.log.warning(
+                        "[main-transfer] Technical Issue detected; switching Clash node before retry %s/%s",
+                        attempt,
+                        limit,
+                    )
+                    try:
+                        cfg = clash_verge_rotator.load_config(ROOT / "config.json")
+                        if cfg.enabled:
+                            selected = clash_verge_rotator.switch_once(cfg, self.log)
+                            self.log.info("[main-transfer] Clash node switched after Technical Issue: %s", selected)
+                        else:
+                            self.log.warning("[main-transfer] Clash Verge rotation disabled; retrying without node switch")
+                    except Exception as switch_exc:
+                        self.log.warning("[main-transfer] Clash node switch after Technical Issue failed: %s", switch_exc)
+                    self.log.info("[main-transfer] waiting 10s before dismissing error and retrying transfer")
+                    time.sleep(10)
+                    state = self.adb.dump_ui()
+                    self.dismiss_technical_issue(state)
+                    time.sleep(2)
+            raise MainTransferError("main transfer retry loop exited unexpectedly")
         finally:
             self.adb.force_stop_gopay(self.package)
 

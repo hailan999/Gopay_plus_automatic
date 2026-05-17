@@ -65,6 +65,16 @@
     "http_retry_base_sleep_s": 2,
     "chatgpt_checkout_timeout_s": 45
   },
+  "clash_verge_rotation": {
+    "enabled": false,
+    "controller": "http://127.0.0.1:9097",
+    "secret": "set-your-secret",
+    "group_name": "SDK DNS",
+    "interval_minutes": 30,
+    "switch_at_start": true,
+    "include_keywords": ["香港", "日本", "美国", "台湾"],
+    "exclude_keywords": ["DIRECT", "自动", "故障", "动态", "剩余", "重置", "套餐", "官网", "注意", "不推荐", "test"]
+  },
   "fingerprint": {
     "locale": "id-ID",
     "language": "id-ID",
