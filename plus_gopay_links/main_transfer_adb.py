@@ -455,32 +455,69 @@ class MainGoPayTransferFlow:
         self.log.info("[main-transfer] tapping GoPay under Transfer to others")
         self.adb.tap_rel(state, 0.80, 0.68)
 
-    def enter_recipient(self, full_phone: str) -> None:
-        state = self.wait_state(lambda s: s.contains("Transfer to new recipient", "Enter name or phone number"), "GoPay recipient page", timeout=25)
-        self.log.info("[main-transfer] recipient page ready; input phone %s", full_phone)
+    def focus_recipient_search(self, state: UiState) -> None:
         field = state.find_edit_text()
         if field:
             x = int(state.width * 0.50)
             y = min(field.bounds.top + 95, int(state.height * 0.38))
             self.log.info("[main-transfer] focusing phone search field at %s,%s", x, y)
             self.adb.tap(x, y)
-        else:
-            node = state.find("Enter name or phone number")
-            if node:
-                self.adb.tap(node.bounds.cx, node.bounds.cy)
-            else:
-                self.adb.tap_rel(state, 0.45, 0.38)
-        time.sleep(0.8)
-        self.adb.clear_text()
-        self.adb.text(full_phone)
-        self.log.info("[main-transfer] phone entered; waiting for transfer-to result")
-        state = self.wait_state(lambda s: s.contains("Tap here to transfer to", full_phone[-6:]), "recipient search result", timeout=20)
+            return
+        node = state.find("Enter name or phone number", "Search")
+        if node:
+            self.adb.tap(node.bounds.cx, node.bounds.cy)
+            return
+        self.adb.tap_rel(state, 0.45, 0.38)
+
+    def tap_recipient_result(self, state: UiState, full_phone: str) -> bool:
+        if state.contains("Review transfer", "Rp") or state.contains("Registered phone number", "Verify"):
+            return True
         node = state.find("Tap here to transfer to")
         if node:
-            self.log.info("[main-transfer] tapping transfer-to result")
+            self.log.info("[main-transfer] tapping recipient result %r", node.label)
             self.adb.tap(node.bounds.cx, node.bounds.cy)
-        else:
-            self.adb.tap_rel(state, 0.45, 0.71)
+            return True
+        if state.contains(full_phone[-6:], "This number isn't on your contact list"):
+            self.log.info("[main-transfer] tapping recipient result fallback row")
+            self.adb.tap_rel(state, 0.50, 0.75)
+            return True
+        if state.contains("Next"):
+            self.log.info("[main-transfer] recipient result not visible; tapping Next fallback")
+            if not self.tap_lowest_text(state, "Next"):
+                self.adb.tap_rel(state, 0.90, 0.95)
+            return True
+        return False
+
+    def enter_recipient(self, full_phone: str) -> None:
+        last_text = ""
+        for attempt in range(1, 4):
+            state = self.wait_state(
+                lambda s: s.contains("Transfer to new recipient", "Enter name or phone number", "Review transfer", "Rp"),
+                "GoPay recipient page",
+                timeout=25,
+            )
+            if state.contains("Review transfer", "Rp"):
+                self.log.info("[main-transfer] amount page opened while entering recipient")
+                return
+            self.log.info("[main-transfer] recipient page ready; input phone %s attempt=%s", full_phone, attempt)
+            self.focus_recipient_search(state)
+            time.sleep(0.8)
+            self.adb.clear_text()
+            self.adb.digits(full_phone)
+            self.adb.shell("input keyevent 66", timeout=5)
+            self.log.info("[main-transfer] phone entered; waiting for transfer-to result")
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                state = self.adb.dump_ui()
+                last_text = state.text[:400]
+                if state.contains("Review transfer", "Rp", "Registered phone number", "Verify"):
+                    return
+                if state.contains("Tap here to transfer to", full_phone[-6:], "This number isn't on your contact list"):
+                    if self.tap_recipient_result(state, full_phone):
+                        return
+                time.sleep(1)
+            self.log.warning("[main-transfer] recipient search result not visible; retrying input")
+        raise MainTransferError(f"timeout waiting for recipient search result; screen={last_text!r}")
 
     def verify_and_trust(self) -> None:
         state = self.wait_state(
