@@ -1730,12 +1730,25 @@ class GoPayRegisterFlow:
             self.adb.shell("input swipe 280 850 280 420 500")
             time.sleep(1)
             return
-        if state.contains("Top up", "Withdraw", "Home", "Profile", "QRIS"):
+        if state.contains("Top up", "Withdraw", "Home", "Profile"):
             if self.tap_exact_text(state, "Profile") or self.tap_text(state, "Profile"):
                 return
             self.log.info("Profile tab not found by text; tapping bottom-right tab")
             self.adb.tap_rel(state, 0.90, 0.94)
             return
+
+    def handle_qris_detour(self, state: UiState) -> bool:
+        if state.contains("take pictures and record video"):
+            if self.tap_exact_text(state, "DENY", "Don't allow"):
+                time.sleep(1)
+            self.log.info("Camera permission appeared during PIN setup navigation; backing out of QRIS")
+            self.adb.keyevent(4)
+            return True
+        if state.contains("Show QRIS", "QRIS Tap", "Upload QR", "Available QRIS promos"):
+            self.log.info("QRIS screen opened before PIN setup; backing out to continue Profile navigation")
+            self.adb.keyevent(4)
+            return True
+        return False
 
     def is_pin_keypad_screen(self, state: UiState) -> bool:
         if state.contains("Confirm PIN"):
@@ -1803,6 +1816,9 @@ class GoPayRegisterFlow:
             self.log.info("PIN success screen appeared while waiting for OTP; continuing to next step")
             self.tap_text(state, "Got it")
             return True
+        if self.pin_setup_completed_after_otp(state):
+            self.log.info("Security score page appeared while waiting for PIN OTP; treating PIN setup as complete")
+            return True
         return False
 
     def finish_after_open_gift(self, detail: str = "Open gift tapped") -> None:
@@ -1820,14 +1836,19 @@ class GoPayRegisterFlow:
         return state.contains("25%", "1/4 actions completed", "Maximize your security")
 
     def pin_setup_completed_after_otp(self, state: UiState) -> bool:
-        if self.pin_success_confirmed or not self.pin_otp_submitted or self.pin_entries < 2:
+        if self.pin_success_confirmed or self.pin_entries < 2:
             return False
-        # After PIN OTP is accepted, GoPay often returns to Account & safety
-        # without showing the "successfully updated" toast. At that point 25% /
-        # 1/4 means the PIN task is done, not that Create PIN should be opened
-        # again. Treat either Manage PIN or the security score landing page as
-        # enough evidence to stop the reset loop.
-        return state.contains("Manage PIN", "25%", "1/4 actions completed", "Account & safety", "Account protection")
+        # After the second PIN entry or PIN OTP, GoPay can land on the security
+        # score page without showing the success toast. At that point 25% / 1/4
+        # means the PIN task is done, not that Create PIN should be opened again.
+        return state.contains(
+            "Manage PIN",
+            "25%",
+            "1/4 actions completed",
+            "Account & safety",
+            "Account protection",
+            "Maximize your security",
+        )
 
     def stop_existing_pin_account(self, state: UiState, detail: str) -> bool:
         if not state.contains("Manage PIN"):
@@ -2040,6 +2061,9 @@ class GoPayRegisterFlow:
 
             if state.contains("error", "failed", "try again later"):
                 raise RegisterError(f"GoPay showed an error screen: {brief}")
+
+            if self.handle_qris_detour(state):
+                continue
 
             before = time.time()
             self.handle_home_or_profile(state)
