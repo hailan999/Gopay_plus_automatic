@@ -1415,6 +1415,7 @@ class GoPayRegisterFlow:
         self.pin_success_confirmed = False
         self.step_index = 0
         self.technical_issue_retries = 0
+        self.last_details_seen_at = 0.0
 
     def save_observation(self, state: UiState, reason: str) -> None:
         STEP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1477,6 +1478,7 @@ class GoPayRegisterFlow:
 
     def input_name(self, state: UiState) -> None:
         self.log.info("Input account name")
+        self.last_details_seen_at = time.time()
         field = state.find_edit_text()
         if field:
             self.log.info("Focus name EditText at %s,%s", field.bounds.cx, field.bounds.cy)
@@ -1500,6 +1502,22 @@ class GoPayRegisterFlow:
             )
         raise RegisterError("Create account button not found after name input")
         self.did_name = True
+
+    def handle_blank_after_details(self, state: UiState) -> bool:
+        if state.text.strip():
+            return False
+        if not self.last_details_seen_at or time.time() - self.last_details_seen_at > 45:
+            return False
+        self.log.info("Blank UI dump right after details screen; using name/create-account fallback")
+        if not self.did_name:
+            self.adb.tap_rel(state, 0.18, 0.31)
+            self.adb.clear_text()
+            self.adb.text(self.args.name)
+            self.did_name = True
+            time.sleep(0.5)
+        self.adb.tap_rel(state, 0.50, 0.94)
+        time.sleep(1.5)
+        return True
 
     def input_otp(self, state: UiState) -> bool:
         if self.args.dry_run:
@@ -1527,11 +1545,18 @@ class GoPayRegisterFlow:
                 allow_reused=self.args.allow_reused_otp,
                 resend_after_seconds=resend_after,
                 on_resend=resend_action if resend_after else None,
-                should_stop_waiting=self.stop_pin_otp_wait_if_success if self.pin_entries > 0 else None,
+                should_stop_waiting=(
+                    self.stop_pin_otp_wait_if_success
+                    if self.pin_entries > 0
+                    else self.stop_registration_otp_wait_if_details
+                ),
             )
         except OtpNoLongerNeeded:
-            self.finish_after_pin_success()
-            return True
+            if self.pin_entries > 0:
+                self.finish_after_pin_success()
+                return True
+            self.log.info("Registration OTP wait stopped because GoPay already reached details screen")
+            return False
         except OtpTimeoutError:
             remember_number_usage(
                 self.args.full_phone or self.args.phone_number,
@@ -1555,10 +1580,22 @@ class GoPayRegisterFlow:
         time.sleep(2)
         return False
 
+    def stop_registration_otp_wait_if_details(self) -> bool:
+        state = self.adb.dump_ui()
+        if self.handle_otp_wait_interrupt(state):
+            return False
+        if state.contains("Fill out a few details"):
+            self.last_details_seen_at = time.time()
+            self.log.info("Details screen appeared while waiting for registration OTP; continuing")
+            return True
+        return False
+
     def resend_current_otp(self) -> bool:
         stage = "PIN OTP" if self.pin_entries > 0 else "registration OTP"
         self.log.info("%s still not received/refreshed; trying GoPay Resend", stage)
         state = self.adb.dump_ui()
+        if self.handle_otp_wait_interrupt(state):
+            return False
         if self.pin_entries > 0 and self.pin_success_visible(state):
             self.log.info("PIN success screen is already visible; no resend needed")
             return False
@@ -1611,17 +1648,37 @@ class GoPayRegisterFlow:
         if self.technical_issue_retries > limit:
             raise RegisterError(f"GoPay offline popup persisted after {limit} retries")
         self.log.info(
-            "GoPay offline popup detected; tapping Try again %s/%s",
+            "GoPay offline popup detected; switching Clash node before retry %s/%s",
             self.technical_issue_retries,
             limit,
         )
-        if self.tap_text(state, "Try again", "Retry"):
-            time.sleep(3)
+        try:
+            rotation_cfg = clash_verge_rotator.load_config(Path(self.args.config))
+            if rotation_cfg.enabled:
+                selected = clash_verge_rotator.switch_once(rotation_cfg, self.log)
+                self.log.info("Clash node switched after offline popup: %s", selected)
+            else:
+                self.log.warning("Clash Verge rotation is disabled; offline retry will not switch node")
+        except Exception as exc:
+            self.log.warning("Clash node switch after offline popup failed: %s", exc)
+        self.log.info("Waiting 10s before tapping Try again")
+        time.sleep(10)
+        fresh_state = self.adb.dump_ui()
+        if self.tap_exact_text(fresh_state, "Try again", "Retry"):
             return True
         self.log.info("Offline Try again button not found; tapping fallback bottom button")
-        self.adb.tap_rel(state, 0.50, 0.92)
-        time.sleep(3)
+        self.adb.tap_rel(fresh_state, 0.50, 0.92)
         return True
+
+    def handle_otp_wait_interrupt(self, state: UiState) -> bool:
+        if self.handle_offline_popup(state):
+            self.log.info("Handled offline popup while waiting for OTP")
+            return True
+        if state.contains("Technical Issue", "There's a technical error"):
+            self.handle_technical_issue(state)
+            self.log.info("Handled Technical Issue while waiting for OTP")
+            return True
+        return False
 
     def input_pin(self, state: UiState) -> None:
         if self.args.dry_run:
@@ -1740,6 +1797,8 @@ class GoPayRegisterFlow:
 
     def stop_pin_otp_wait_if_success(self) -> bool:
         state = self.adb.dump_ui()
+        if self.handle_otp_wait_interrupt(state):
+            return False
         if self.pin_success_visible(state):
             self.log.info("PIN success screen appeared while waiting for OTP; continuing to next step")
             self.tap_text(state, "Got it")
@@ -1929,10 +1988,14 @@ class GoPayRegisterFlow:
                 continue
 
             if state.contains("Fill out a few details"):
+                self.last_details_seen_at = time.time()
                 if not self.did_name:
                     self.input_name(state)
                 else:
                     self.tap_text(state, "Create account")
+                continue
+
+            if self.handle_blank_after_details(state):
                 continue
 
             if state.contains("Received from", "Open before someone else"):

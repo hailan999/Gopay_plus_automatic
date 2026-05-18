@@ -383,6 +383,7 @@ class MainGoPayTransferFlow:
         self.package = str(cfg.get("package") or DEFAULT_PACKAGE)
         self.pin = str(cfg.get("pin") or "211314")
         self.timeout = max(30, int(cfg.get("timeout_seconds") or cfg.get("timeout") or 180))
+        self.pin_result_timeout = max(35, int(cfg.get("pin_result_timeout_seconds") or 90))
 
     def wait_state(self, predicate: Callable[[UiState], bool], label: str, timeout: int = 30) -> UiState:
         deadline = time.time() + timeout
@@ -421,6 +422,20 @@ class MainGoPayTransferFlow:
             return False
         node = max(matches, key=lambda item: item.bounds.cy)
         self.log.info("[main-transfer] tap lowest %r", node.label)
+        self.adb.tap(node.bounds.cx, node.bounds.cy)
+        return True
+
+    def tap_bottom_exact_text(self, state: UiState, *labels: str) -> bool:
+        lowered = [label.lower() for label in labels if label]
+        min_y = int(state.height * 0.70)
+        matches = [
+            node for node in state.nodes
+            if node.enabled and node.bounds.cy >= min_y and node.label.strip().lower() in lowered
+        ]
+        if not matches:
+            return False
+        node = max(matches, key=lambda item: item.bounds.cy)
+        self.log.info("[main-transfer] tap bottom exact %r", node.label)
         self.adb.tap(node.bounds.cx, node.bounds.cy)
         return True
 
@@ -488,6 +503,21 @@ class MainGoPayTransferFlow:
             return True
         return False
 
+    def wait_after_recipient_tap(self, full_phone: str, timeout: int = 8) -> bool:
+        deadline = time.time() + timeout
+        last_text = ""
+        while time.time() < deadline:
+            state = self.adb.dump_ui()
+            last_text = state.text[:300]
+            if state.contains("Review transfer", "Rp", "Registered phone number", "Verify"):
+                return True
+            if not state.contains("Transfer to new recipient", "Tap here to transfer to", full_phone[-6:]):
+                self.log.info("[main-transfer] recipient page changed after tapping result")
+                return True
+            time.sleep(1)
+        self.log.warning("[main-transfer] recipient result tap did not change page; screen=%r", last_text)
+        return False
+
     def enter_recipient(self, full_phone: str) -> None:
         last_text = ""
         for attempt in range(1, 4):
@@ -514,7 +544,8 @@ class MainGoPayTransferFlow:
                     return
                 if state.contains("Tap here to transfer to", full_phone[-6:], "This number isn't on your contact list"):
                     if self.tap_recipient_result(state, full_phone):
-                        return
+                        if self.wait_after_recipient_tap(full_phone):
+                            return
                 time.sleep(1)
             self.log.warning("[main-transfer] recipient search result not visible; retrying input")
         raise MainTransferError(f"timeout waiting for recipient search result; screen={last_text!r}")
@@ -554,7 +585,14 @@ class MainGoPayTransferFlow:
         last_text = ""
         for attempt in range(1, 4):
             state = self.wait_state(
-                lambda s: s.contains("Transfer amount", "Admin fee", "Free admin fee", "Transfer"),
+                lambda s: s.contains(
+                    "Transfer amount",
+                    "Admin fee",
+                    "Free admin fee",
+                    "Transfer",
+                    "Enter your PIN",
+                    "6-digit PIN",
+                ),
                 "Review page",
                 timeout=25,
             )
@@ -562,7 +600,7 @@ class MainGoPayTransferFlow:
             if state.contains("Enter your PIN", "6-digit PIN"):
                 return
             self.log.info("[main-transfer] tapping final Transfer button attempt=%s", attempt)
-            if not self.tap_lowest_text(state, "Transfer"):
+            if not self.tap_bottom_exact_text(state, "Transfer"):
                 self.adb.tap_rel(state, 0.50, 0.96)
             deadline = time.time() + 8
             while time.time() < deadline:
@@ -570,6 +608,8 @@ class MainGoPayTransferFlow:
                 last_text = state.text[:400]
                 if state.contains("Enter your PIN", "6-digit PIN"):
                     return
+                if self.technical_issue_visible(state):
+                    raise MainTransferTechnicalIssue(f"GoPay technical issue after final Transfer tap; screen={last_text!r}")
                 if self.gopay_error_visible(state):
                     raise MainTransferError(f"GoPay error after final Transfer tap; screen={last_text!r}")
                 time.sleep(1)
@@ -577,7 +617,26 @@ class MainGoPayTransferFlow:
         raise MainTransferError(f"final Transfer did not open PIN page after retries; screen={last_text!r}")
 
     def transfer_success_visible(self, state: UiState) -> bool:
-        return state.contains("successful", "success", "Transfer details", "Transaction details", "Share receipt")
+        return state.contains(
+            "successful",
+            "success",
+            "Transfer details",
+            "Transaction details",
+            "Share receipt",
+            "Berhasil",
+            "Rincian transfer",
+        )
+
+    def transfer_processing_visible(self, state: UiState) -> bool:
+        text = state.text.strip()
+        return (
+            state.contains("processing", "please wait", "loading", "Cancel", "Help")
+            and not self.pin_error_visible(state)
+            and not self.technical_issue_visible(state)
+            and not self.gopay_error_visible(state)
+            and not state.contains("Enter your PIN", "6-digit PIN")
+            and len(text) <= 120
+        )
 
     def pin_error_visible(self, state: UiState) -> bool:
         return state.contains(
@@ -616,8 +675,9 @@ class MainGoPayTransferFlow:
         state = self.wait_state(lambda s: s.contains("Enter your PIN", "6-digit PIN"), "PIN page", timeout=25)
         self.log.info("[main-transfer] entering PIN")
         self.tap_pin_digits(state, self.pin)
-        deadline = time.time() + 35
+        deadline = time.time() + self.pin_result_timeout
         last_text = ""
+        last_wait_log = 0.0
         while time.time() < deadline:
             state = self.adb.dump_ui()
             last_text = state.text[:400]
@@ -631,7 +691,14 @@ class MainGoPayTransferFlow:
             if self.gopay_error_visible(state):
                 raise MainTransferError(f"GoPay error after transfer PIN; screen={last_text!r}")
             if not state.contains("Enter your PIN", "6-digit PIN"):
-                self.log.info("[main-transfer] PIN page left; waiting for explicit transfer result")
+                now = time.time()
+                if self.transfer_processing_visible(state):
+                    if now - last_wait_log >= 8:
+                        self.log.info("[main-transfer] transfer result still processing; waiting")
+                        last_wait_log = now
+                elif now - last_wait_log >= 8:
+                    self.log.info("[main-transfer] PIN page left; waiting for explicit transfer result")
+                    last_wait_log = now
             time.sleep(1)
         raise MainTransferError(f"transfer success not confirmed after PIN; screen={last_text!r}")
 
