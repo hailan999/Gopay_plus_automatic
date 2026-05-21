@@ -176,6 +176,8 @@ def _safe_response_headers(headers: Any) -> dict[str, str]:
         "content-type",
         "cf-ray",
         "server",
+        "request-id",
+        "stripe-version",
         "x-request-id",
         "openai-processing-ms",
         "set-cookie",
@@ -581,6 +583,9 @@ class GoPayCharger:
         if not cs_id or not str(cs_id).startswith("cs_"):
             raise GoPayError(f"checkout create: bad response {data!r}")
         self.log(f"[gopay] checkout created cs={cs_id}")
+        checkout_url = str(data.get("url") or "")
+        if checkout_url:
+            self.log(f"[gopay] checkout hosted_url={checkout_url}")
         return cs_id
 
     def _stripe_create_pm(self, cs_id: str, stripe_pk: str, billing: dict) -> str:
@@ -622,16 +627,33 @@ class GoPayCharger:
             "elements_session_client[stripe_js_id]": str(self.fingerprint.get("stripe_js_id")),
             "elements_session_client[locale]": str(self.fingerprint.get("language") or "en-US").split("-")[0],
             "elements_session_client[is_aggregation_expected]": "false",
-            "elements_options_client[stripe_js_locale]": "auto",
             "key": stripe_pk,
         }
+        self.log(
+            "[gopay] stripe init request "
+            f"cs={_mask_secret(cs_id, left=12, right=8)} "
+            f"key={_mask_secret(stripe_pk, left=12, right=8)} "
+            f"locale={body['browser_locale']} "
+            f"timezone={body['browser_timezone']} "
+            f"stripe_js_id={_mask_secret(str(body['elements_session_client[stripe_js_id]']), left=8, right=6)} "
+            f"elements_locale={body['elements_session_client[locale]']} "
+            f"proxy={_mask_proxy_url(self.payment_proxy or self.proxy or '')}"
+        )
         r = self._post(
             self.ext,
             f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
             purpose="stripe checkout init",
             data=body, timeout=DEFAULT_TIMEOUT,
         )
-        r.raise_for_status()
+        self.log(
+            "[gopay] stripe init response "
+            f"status={r.status_code} reason={getattr(r, 'reason', '')!r} "
+            f"url={getattr(r, 'url', '')} "
+            f"headers={_safe_response_headers(getattr(r, 'headers', {}))} "
+            f"body_head={(getattr(r, 'text', '') or '')[:800]!r}"
+        )
+        if r.status_code != 200:
+            raise GoPayError(f"stripe init {r.status_code}: {(r.text or '')[:800]}")
         data = r.json() or {}
         pm_types = [pm for pm in data.get("payment_method_types", []) if isinstance(pm, str)]
         currency = str(data.get("currency") or "").lower()
@@ -801,6 +823,7 @@ class GoPayCharger:
                     rtu = (si.get("next_action") or {}).get("redirect_to_url") or {}
                     pm_url = rtu.get("url") or ""
                     if pm_url:
+                        self.log(f"[gopay] stripe pm_redirect_url={pm_url}")
                         snap_token = self._fetch_pm_redirect_snap_token(pm_url)
                         self.log(f"[gopay] midtrans snap_token={snap_token}")
                         return snap_token

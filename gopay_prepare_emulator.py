@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
 import re
 import shutil
@@ -27,21 +28,54 @@ class PrepareError(RuntimeError):
     pass
 
 
+def kill_process_tree(proc: subprocess.Popen, logger: logging.Logger) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Failed to taskkill timed-out process pid=%s: %s", proc.pid, exc)
+    try:
+        proc.kill()
+    except Exception as exc:
+        logger.warning("Failed to kill timed-out process pid=%s: %s", proc.pid, exc)
+
+
 def run_cmd(cmd: list[str], logger: logging.Logger, timeout: int = 120) -> str:
-    logger.debug("run: %s", " ".join(str(x) for x in cmd))
-    proc = subprocess.run(
+    cmd_text = " ".join(str(x) for x in cmd)
+    logger.debug("run: %s", cmd_text)
+    proc = subprocess.Popen(
         [str(x) for x in cmd],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
-        check=False,
     )
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        kill_process_tree(proc, logger)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        detail = ((stderr or "") + "\n" + (stdout or "")).strip()
+        raise PrepareError(f"command timed out after {timeout}s: {cmd_text} :: {detail[:500]}") from exc
+    out = (stdout or "").strip()
+    err = (stderr or "").strip()
     if proc.returncode != 0:
-        raise PrepareError(f"command failed: {' '.join(str(x) for x in cmd)} :: {err or out}")
+        raise PrepareError(f"command failed: {cmd_text} :: {err or out}")
     return out
 
 

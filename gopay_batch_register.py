@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import random
 import subprocess
 import sys
@@ -211,6 +212,22 @@ def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.
         logger.warning("LDPlayer remove failed index=%s: %s", index, exc)
 
 
+def recover_prepare_index(ld: Path, prep_args: argparse.Namespace | None, logger: WorkerLogger) -> str:
+    if prep_args is None:
+        return ""
+    name = str(getattr(prep_args, "name", "") or "").strip()
+    if not name:
+        return ""
+    try:
+        index = prep.find_instance(ld, name, logger)
+    except Exception as exc:
+        logger.warning("Failed to recover LDPlayer index for name=%s after prepare failure: %s", name, exc)
+        return ""
+    if index:
+        logger.warning("Recovered LDPlayer index=%s for failed prepare name=%s; cleanup can continue", index, name)
+    return str(index or "")
+
+
 def _read_keep_key(timeout_seconds: float) -> bool:
     deadline = time.time() + max(0.0, timeout_seconds)
     if os.name == "nt":
@@ -277,6 +294,108 @@ def build_prepare_args(args: argparse.Namespace, worker_id: int, run_no: int) ->
         print_device=False,
         verbose=args.verbose,
     )
+
+
+def build_prepare_command(prep_args: argparse.Namespace) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(ROOT / "gopay_prepare_emulator.py"),
+        "--ld-dir",
+        str(prep_args.ld_dir),
+        "--name",
+        str(prep_args.name),
+        "--width",
+        str(prep_args.width),
+        "--height",
+        str(prep_args.height),
+        "--dpi",
+        str(prep_args.dpi),
+        "--mt-apk",
+        str(prep_args.mt_apk),
+        "--gopay-apks",
+        str(prep_args.gopay_apks),
+        "--boot-timeout",
+        str(prep_args.boot_timeout),
+        "--print-device",
+    ]
+    if prep_args.index:
+        cmd += ["--index", str(prep_args.index)]
+    if prep_args.create:
+        cmd.append("--create")
+    if prep_args.unique_name:
+        cmd.append("--unique-name")
+    if prep_args.open_mt:
+        cmd.append("--open-mt")
+    if prep_args.verbose:
+        cmd.append("--verbose")
+    return cmd
+
+
+def run_prepare(prep_args: argparse.Namespace, logger: WorkerLogger, timeout: int) -> dict[str, str]:
+    cmd = build_prepare_command(prep_args)
+    logger.info("Starting prepare subprocess: %s", " ".join(cmd))
+    prepared: dict[str, str] = {}
+    with logger.file_path.open("a", encoding="utf-8") as f:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        line_queue: queue.Queue[str] = queue.Queue()
+
+        def _reader() -> None:
+            assert proc.stdout is not None
+            for stdout_line in proc.stdout:
+                line_queue.put(stdout_line)
+
+        reader = threading.Thread(target=_reader, name="prepare-log-reader", daemon=True)
+        reader.start()
+
+        def handle_line(line: str) -> None:
+            f.write(line)
+            f.flush()
+            text = line.rstrip()
+            with print_lock:
+                print(f"[{logger.file_path.parent.name}] {text}")
+            if text.startswith("PREPARED_INDEX="):
+                prepared["index"] = text.split("=", 1)[1].strip()
+            elif text.startswith("PREPARED_DEVICE="):
+                prepared["device"] = text.split("=", 1)[1].strip()
+
+        try:
+            start = time.time()
+            while proc.poll() is None:
+                try:
+                    handle_line(line_queue.get(timeout=0.5))
+                except queue.Empty:
+                    pass
+                if timeout > 0 and time.time() - start > timeout:
+                    logger.warning("Prepare subprocess timeout after %ss; terminating", timeout)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("Prepare subprocess did not terminate; killing")
+                        proc.kill()
+                    raise RuntimeError(f"prepare subprocess timeout after {timeout}s")
+            code = proc.wait()
+            while True:
+                try:
+                    handle_line(line_queue.get_nowait())
+                except queue.Empty:
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        if code != 0:
+            raise RuntimeError(f"prepare subprocess exited code={code}")
+    if not prepared.get("index") or not prepared.get("device"):
+        raise RuntimeError(f"prepare subprocess did not report index/device: {prepared}")
+    return prepared
 
 
 def build_register_command(args: argparse.Namespace, device: str, run_dir: Path) -> list[str]:
@@ -361,14 +480,15 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
         index = ""
         device = ""
         success = False
+        prep_args = None
         try:
             logger.info("Run started worker=%02d run=%05d", worker_id, run_no)
             prep_args = build_prepare_args(args, worker_id, run_no)
             if args.parallel_prepare:
-                result = prep.prepare(prep_args, logger)
+                result = run_prepare(prep_args, logger, args.prepare_timeout)
             else:
                 with prepare_lock:
-                    result = prep.prepare(prep_args, logger)
+                    result = run_prepare(prep_args, logger, args.prepare_timeout)
             index = str(result.get("index") or "")
             device = str(result.get("device") or "")
             logger.info("Prepared index=%s device=%s", index, device)
@@ -384,6 +504,8 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
             logger.info("Register subprocess exited code=%s success=%s", code, success)
         except Exception as exc:
             logger.error("Run failed: %s", exc)
+            if not index:
+                index = recover_prepare_index(ld, prep_args, logger)
         finally:
             if index and (success or not args.keep_failed):
                 if confirm_keep_instance(args, index, success, logger):
@@ -413,6 +535,7 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--confirm-keep-window", action="store_true", help="After each run, wait briefly for K to keep the emulator before cleanup")
     parser.add_argument("--confirm-keep-timeout", type=float, default=5.0, help="Seconds to wait for --confirm-keep-window")
     parser.add_argument("--parallel-prepare", action="store_true", help="Allow LDPlayer prepare steps to run concurrently")
+    parser.add_argument("--prepare-timeout", type=int, default=420, help="Per-emulator prepare subprocess timeout seconds; 0 disables")
     parser.add_argument("--register-timeout", type=int, default=1800, help="Per-register subprocess timeout seconds; 0 disables")
     parser.add_argument("--config", default=str(ROOT / "config.json"))
     parser.add_argument("--ld-dir", default=str(DEFAULT_LD_DIR))

@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -48,6 +49,10 @@ UI_DUMP_DEVICE_PATH = "/sdcard/window.xml"
 DEFAULT_WEBUI_DB = Path(r"E:\development\git_projects\Gpt-Agreement-Payment\output\webui.db")
 # Temporary: skip receiving gifts, but still continue to the subscribe step after PIN setup.
 RECEIVE_GIFT_AFTER_PIN = False
+GOPAY_LAUNCH_RETRIES = 3
+GOPAY_LAUNCH_WAIT_SECONDS = 12
+PIN_SUBMIT_TIMEOUT_SECONDS = 60
+NAME_CREATE_TIMEOUT_SECONDS = 90
 
 CONNECT_PORTS = (5555, 5557, 5559, 5561, 7555)
 GOPAY_PACKAGE_CANDIDATES = (
@@ -59,9 +64,7 @@ REGISTER_EXCEPTIONS = (
     {
         "name": "phone_already_registered",
         "needles": (
-            "Other ways to log in",
             "This is not my account",
-            "create a new account",
         ),
         "reason": "phone appears to be registered already",
         "action": "mark_phone_unusable",
@@ -383,6 +386,16 @@ def normalize_herosms_country_id(value: str) -> str:
         "indonesia": "6",
     }
     return aliases.get(value.lower(), value)
+
+
+def format_herosms_price(value: object) -> str:
+    try:
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise RegisterError(f"invalid HeroSMS maxPrice: {value!r}")
+    if price <= 0:
+        raise RegisterError(f"HeroSMS maxPrice must be positive: {value!r}")
+    return format(price.normalize(), "f")
 
 
 def adb_text(value: str) -> str:
@@ -1022,13 +1035,57 @@ class Adb:
         return packages
 
     def start_package(self, package: str) -> None:
-        proc = self.raw(
-            ["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
-            timeout=20,
-        )
-        if proc.returncode != 0 or "monkey aborted" in (proc.stdout or "").lower():
-            raise RegisterError(f"failed to launch package {package}: {proc.stdout or proc.stderr}")
-        time.sleep(3)
+        last_focus = ""
+        for attempt in range(1, GOPAY_LAUNCH_RETRIES + 1):
+            proc = self.raw(
+                ["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+                timeout=20,
+            )
+            if proc.returncode != 0 or "monkey aborted" in (proc.stdout or "").lower():
+                raise RegisterError(f"failed to launch package {package}: {proc.stdout or proc.stderr}")
+            deadline = time.time() + GOPAY_LAUNCH_WAIT_SECONDS
+            while time.time() < deadline:
+                last_focus = self.foreground_summary()
+                if package in last_focus:
+                    self.log.info("GoPay package is foreground after launch attempt %s/%s", attempt, GOPAY_LAUNCH_RETRIES)
+                    return
+                time.sleep(2)
+            self.log.warning(
+                "GoPay package not foreground after launch attempt %s/%s; focus=%s",
+                attempt,
+                GOPAY_LAUNCH_RETRIES,
+                last_focus[:300] or "<empty>",
+            )
+            try:
+                self.shell(f"am force-stop {shlex.quote(package)}", timeout=8)
+            except Exception as exc:
+                self.log.debug("force-stop after launch retry failed: %s", exc)
+        raise RegisterError(f"GoPay failed to launch package={package}; foreground={last_focus[:500] or '<empty>'}")
+
+    def foreground_summary(self) -> str:
+        lines: list[str] = []
+        for command in ("dumpsys window", "dumpsys activity activities"):
+            try:
+                out = self.shell(command, timeout=15)
+            except Exception as exc:
+                lines.append(f"{command} failed: {exc}")
+                continue
+            for line in out.splitlines():
+                if any(
+                    marker in line
+                    for marker in (
+                        "mCurrentFocus",
+                        "mFocusedApp",
+                        "mInputMethodTarget",
+                        "mResumedActivity",
+                        "topResumedActivity",
+                        "ResumedActivity",
+                    )
+                ):
+                    lines.append(line.strip())
+                if len(lines) >= 30:
+                    break
+        return "\n".join(lines)
 
     def force_stop_gopay(self, package: str = "") -> None:
         packages = []
@@ -1347,7 +1404,7 @@ class HeroSmsClient:
             "service": service,
             "country": str(country),
             "api_key": self.api_key,
-            "maxPrice": f"{float(max_price):.2f}",
+            "maxPrice": format_herosms_price(max_price),
         }
         if fixed_price:
             params["fixedPrice"] = str(fixed_price)
@@ -1413,6 +1470,8 @@ class GoPayRegisterFlow:
         self.pin_entries = 0
         self.pin_otp_submitted = False
         self.pin_success_confirmed = False
+        self.pin_submit_started_at = 0.0
+        self.pin_submit_retries = 0
         self.step_index = 0
         self.technical_issue_retries = 0
         self.last_details_seen_at = 0.0
@@ -1477,8 +1536,39 @@ class GoPayRegisterFlow:
         self.did_phone = True
 
     def input_name(self, state: UiState) -> None:
-        self.log.info("Input account name")
+        deadline = time.time() + NAME_CREATE_TIMEOUT_SECONDS
+        attempt = 0
         self.last_details_seen_at = time.time()
+        current_state = state
+        while time.time() < deadline:
+            attempt += 1
+            self.log.info("Input account name attempt %s", attempt)
+            if self.handle_offline_popup(current_state) or self.handle_too_many_attempts(current_state):
+                current_state = self.adb.dump_ui()
+                continue
+            if current_state.contains("Technical Issue", "There's a technical error"):
+                self.handle_technical_issue(current_state)
+                current_state = self.adb.dump_ui()
+                continue
+
+            self.focus_name_field(current_state)
+            self.adb.clear_text()
+            self.adb.text(self.args.name)
+            self.adb.keyevent(66)
+            if self.tap_create_account_after_name(min(deadline, time.time() + 8)):
+                self.did_name = True
+                return
+            current_state = self.adb.dump_ui()
+            disabled_create = current_state.find("Create account", enabled_only=False, exact=True)
+            if disabled_create and not disabled_create.enabled:
+                self.log.info("Create account still disabled; re-entering name")
+                continue
+            self.log.info("Create account not clickable yet; retrying name entry")
+        raise RegisterError(
+            f"name input did not enable Create account after {NAME_CREATE_TIMEOUT_SECONDS}s"
+        )
+
+    def focus_name_field(self, state: UiState) -> None:
         field = state.find_edit_text()
         if field:
             self.log.info("Focus name EditText at %s,%s", field.bounds.cx, field.bounds.cy)
@@ -1487,21 +1577,34 @@ class GoPayRegisterFlow:
         else:
             self.log.info("Focus name fallback area")
             self.adb.tap_rel(state, 0.18, 0.31)
-        self.adb.clear_text()
-        self.adb.text(self.args.name)
-        self.adb.keyevent(66)
-        time.sleep(0.8)
-        next_state = self.adb.dump_ui()
-        if self.tap_exact_text(next_state, "Create account"):
-            self.did_name = True
-            return
-        disabled_create = next_state.find("Create account", enabled_only=False, exact=True)
-        if disabled_create and not disabled_create.enabled:
-            raise RegisterError(
-                "name input did not enable Create account; check whether the field accepted the name"
-            )
-        raise RegisterError("Create account button not found after name input")
-        self.did_name = True
+
+    def tap_create_account_after_name(self, deadline: float) -> bool:
+        last_state: Optional[UiState] = None
+        while time.time() < deadline:
+            time.sleep(1)
+            state = self.adb.dump_ui()
+            last_state = state
+            if self.handle_offline_popup(state) or self.handle_too_many_attempts(state):
+                return False
+            if state.contains("Technical Issue", "There's a technical error"):
+                self.handle_technical_issue(state)
+                return False
+            if self.tap_exact_text(state, "Create account"):
+                return True
+            disabled_create = state.find("Create account", enabled_only=False, exact=True)
+            if disabled_create and not disabled_create.enabled:
+                self.log.info("Create account still disabled after name input; waiting")
+                continue
+            if self.tap_text(state, "Create account"):
+                return True
+        if last_state:
+            create_node = last_state.find("Create account", enabled_only=False, exact=True)
+            if create_node and create_node.enabled:
+                self.log.info("Create account enabled but not tapped by text; tapping fallback bottom button")
+                self.adb.tap_rel(last_state, 0.50, 0.94)
+                time.sleep(1.5)
+                return True
+        return False
 
     def handle_blank_after_details(self, state: UiState) -> bool:
         if state.text.strip():
@@ -1670,9 +1773,45 @@ class GoPayRegisterFlow:
         self.adb.tap_rel(fresh_state, 0.50, 0.92)
         return True
 
+    def handle_too_many_attempts(self, state: UiState) -> bool:
+        if not (
+            state.contains_all("Too many attempts", "60 minutes")
+            or state.contains_all("Too many attempts", "request is blocked")
+        ):
+            return False
+        self.technical_issue_retries += 1
+        limit = max(1, int(getattr(self.args, "technical_issue_retry_limit", 5) or 5))
+        if self.technical_issue_retries > limit:
+            raise RegisterError(f"GoPay Too many attempts persisted after {limit} retries")
+        self.log.info(
+            "GoPay Too many attempts detected; switching Clash node before retry %s/%s",
+            self.technical_issue_retries,
+            limit,
+        )
+        try:
+            rotation_cfg = clash_verge_rotator.load_config(Path(self.args.config))
+            if rotation_cfg.enabled:
+                selected = clash_verge_rotator.switch_once(rotation_cfg, self.log)
+                self.log.info("Clash node switched after Too many attempts: %s", selected)
+            else:
+                self.log.warning("Clash Verge rotation is disabled; Too many attempts retry will not switch node")
+        except Exception as exc:
+            self.log.warning("Clash node switch after Too many attempts failed: %s", exc)
+        self.log.info("Waiting 10s before dismissing Too many attempts")
+        time.sleep(10)
+        fresh_state = self.adb.dump_ui()
+        if self.tap_exact_text(fresh_state, "Okay", "OK"):
+            return True
+        self.log.info("Too many attempts Okay button not found; tapping fallback bottom button")
+        self.adb.tap_rel(fresh_state, 0.50, 0.92)
+        return True
+
     def handle_otp_wait_interrupt(self, state: UiState) -> bool:
         if self.handle_offline_popup(state):
             self.log.info("Handled offline popup while waiting for OTP")
+            return True
+        if self.handle_too_many_attempts(state):
+            self.log.info("Handled Too many attempts while waiting for OTP")
             return True
         if state.contains("Technical Issue", "There's a technical error"):
             self.handle_technical_issue(state)
@@ -1684,6 +1823,7 @@ class GoPayRegisterFlow:
         if self.args.dry_run:
             self.log.info("Dry run: PIN page detected, not typing PIN")
             raise RegisterError("dry-run stopped at PIN page")
+        is_confirm_pin = state.contains("Confirm PIN")
         self.pin_entries += 1
         self.log.info("Input PIN entry %d", self.pin_entries)
         for digit in self.args.pin:
@@ -1693,6 +1833,9 @@ class GoPayRegisterFlow:
         if not self.tap_text(next_state, "Continue", "Save"):
             # Continue/Save is centered above the keypad in the reference images.
             self.adb.tap_rel(next_state, 0.50, 0.46)
+        if is_confirm_pin or self.pin_entries >= 2:
+            self.pin_submit_started_at = time.time()
+            self.log.info("PIN confirm submitted; watching for completion")
 
     def tap_pin_digit(self, state: UiState, digit: str) -> None:
         # Relative keypad positions from gopay-steps/14.png and 15.png.
@@ -1750,7 +1893,80 @@ class GoPayRegisterFlow:
             return True
         return False
 
+    def handle_pin_submit_pending(self, state: UiState) -> bool:
+        if not self.pin_submit_started_at or not state.contains("Confirm PIN"):
+            return False
+        if self.confirm_pin_waiting_for_input(state):
+            self.log.info("Confirm PIN is waiting for input; clearing submit-pending state")
+            self.pin_submit_started_at = 0.0
+            return False
+        elapsed = time.time() - self.pin_submit_started_at
+        if elapsed < PIN_SUBMIT_TIMEOUT_SECONDS:
+            self.log.info(
+                "PIN confirm still submitting; waiting %.0fs/%ss",
+                elapsed,
+                PIN_SUBMIT_TIMEOUT_SECONDS,
+            )
+            time.sleep(5)
+            return True
+        self.pin_submit_retries += 1
+        limit = max(1, int(getattr(self.args, "technical_issue_retry_limit", 5) or 5))
+        if self.pin_submit_retries > limit:
+            raise RegisterError(f"GoPay PIN confirm stayed loading after {limit} recoveries")
+        self.log.warning(
+            "PIN confirm stuck for %.0fs; switching Clash node and restarting GoPay recovery %s/%s",
+            elapsed,
+            self.pin_submit_retries,
+            limit,
+        )
+        try:
+            rotation_cfg = clash_verge_rotator.load_config(Path(self.args.config))
+            if rotation_cfg.enabled:
+                selected = clash_verge_rotator.switch_once(rotation_cfg, self.log)
+                self.log.info("Clash node switched after PIN confirm stuck: %s", selected)
+            else:
+                self.log.warning("Clash Verge rotation is disabled; PIN confirm recovery will not switch node")
+        except Exception as exc:
+            self.log.warning("Clash node switch after PIN confirm stuck failed: %s", exc)
+
+        self.adb.keyevent(4)
+        time.sleep(2)
+        fresh_state = self.adb.dump_ui()
+        if self.pin_success_visible(fresh_state):
+            self.tap_text(fresh_state, "Got it")
+            self.finish_after_pin_success()
+            return True
+        if self.pin_setup_completed_after_otp(fresh_state):
+            self.finish_after_pin_success()
+            return True
+
+        package = str(getattr(self.args, "package", "") or "")
+        if package:
+            self.adb.force_stop_gopay(package)
+            time.sleep(2)
+            self.adb.start_package(package)
+            fresh_state = self.adb.dump_ui()
+            if self.pin_success_visible(fresh_state):
+                self.tap_text(fresh_state, "Got it")
+                self.finish_after_pin_success()
+                return True
+            if self.pin_setup_completed_after_otp(fresh_state):
+                self.finish_after_pin_success()
+                return True
+
+        self.pin_submit_started_at = 0.0
+        self.pin_otp_submitted = False
+        self.pin_entries = 0
+        self.log.info("PIN confirm recovery did not find completion; will navigate to Create PIN again")
+        return True
+
+    def confirm_pin_waiting_for_input(self, state: UiState) -> bool:
+        button = state.find("Confirm", enabled_only=False, exact=True)
+        return bool(button and not button.enabled)
+
     def is_pin_keypad_screen(self, state: UiState) -> bool:
+        if self.pin_submit_started_at and state.contains("Confirm PIN"):
+            return False
         if state.contains("Confirm PIN"):
             return True
         if not state.contains("Create PIN"):
@@ -1782,6 +1998,7 @@ class GoPayRegisterFlow:
 
     def finish_after_pin_success(self) -> None:
         self.pin_success_confirmed = True
+        self.pin_submit_started_at = 0.0
         remember_pin_setup(self.args.full_phone, self.args.name)
         remember_number_usage(
             self.args.full_phone,
@@ -1841,13 +2058,12 @@ class GoPayRegisterFlow:
         # After the second PIN entry or PIN OTP, GoPay can land on the security
         # score page without showing the success toast. At that point 25% / 1/4
         # means the PIN task is done, not that Create PIN should be opened again.
-        return state.contains(
-            "Manage PIN",
+        return state.contains("Manage PIN") or state.contains_all(
+            "Maximize your security",
+            "1/4 actions completed",
+        ) or state.contains_all(
             "25%",
             "1/4 actions completed",
-            "Account & safety",
-            "Account protection",
-            "Maximize your security",
         )
 
     def stop_existing_pin_account(self, state: UiState, detail: str) -> bool:
@@ -1954,6 +2170,9 @@ class GoPayRegisterFlow:
             if self.handle_offline_popup(state):
                 continue
 
+            if self.handle_too_many_attempts(state):
+                continue
+
             exception = self.match_register_exception(state)
             if exception:
                 if self.handle_register_exception(exception, state):
@@ -2039,6 +2258,11 @@ class GoPayRegisterFlow:
                 # These screens are post-registration gift prompts. Go back/home
                 # until the bottom navigation is visible.
                 self.adb.keyevent(4)
+                continue
+
+            if self.handle_pin_submit_pending(state):
+                if self.pin_success_confirmed:
+                    return
                 continue
 
             if self.is_pin_keypad_screen(state):
@@ -2356,7 +2580,7 @@ def build_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--auto-buy-number", action="store_true", help="Buy phone number from HeroSMS before registration")
     parser.add_argument("--sms-service", default="", help="HeroSMS getNumber service code")
     parser.add_argument("--sms-country-id", default="", help="HeroSMS numeric country id")
-    parser.add_argument("--sms-max-price", type=float, default=0.05, help="HeroSMS maxPrice for getNumber")
+    parser.add_argument("--sms-max-price", type=float, default=None, help="HeroSMS maxPrice for getNumber")
     parser.add_argument("--sms-operator", default="", help="HeroSMS operator list for getNumber")
     parser.add_argument("--sms-fixed-price", default="true", help="HeroSMS fixedPrice value for getNumber")
     parser.add_argument("--sms-phone-exception", default="", help="HeroSMS phoneException prefixes")
@@ -2446,8 +2670,8 @@ def enrich_args(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
             or (cfg.get("orchestrator") or {}).get("otp_timeout")
             or 180
         )
-    if not args.sms_max_price:
-        args.sms_max_price = float(otp_sms_cfg.get("maxPrice") or 0.05)
+    if args.sms_max_price is None:
+        args.sms_max_price = otp_sms_cfg.get("maxPrice", 0.05)
     args.post_gift_subscribe = bool(
         args.post_gift_subscribe or post_gift_cfg.get("enabled", True)
     )
@@ -2686,6 +2910,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         package = choose_gopay_package(adb, args.package, log)
+        args.package = package
         log.info("Launching %s", package)
         adb.start_package(package)
 

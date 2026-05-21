@@ -439,6 +439,33 @@ class MainGoPayTransferFlow:
         self.adb.tap(node.bounds.cx, node.bounds.cy)
         return True
 
+    def bottom_exact_text_enabled(self, state: UiState, *labels: str) -> bool:
+        lowered = [label.lower() for label in labels if label]
+        min_y = int(state.height * 0.70)
+        return any(
+            node.enabled
+            and node.bounds.cy >= min_y
+            and node.label.strip().lower() in lowered
+            for node in state.nodes
+        )
+
+    def recipient_search_page_visible(self, state: UiState) -> bool:
+        return state.contains("Transfer to new recipient", "Enter name or phone number")
+
+    def verify_prompt_visible(self, state: UiState) -> bool:
+        return state.contains_all("Registered phone number", "Verify")
+
+    def trust_prompt_visible(self, state: UiState) -> bool:
+        return state.contains("Do you trust the owner", "Trust, continue", "Trust")
+
+    def amount_entry_page_visible(self, state: UiState) -> bool:
+        has_review = state.find("Review transfer", exact=True, enabled_only=False) is not None
+        has_amount_keyboard = state.find("000", "Clear", "Say something", exact=False, enabled_only=False) is not None
+        return has_review and has_amount_keyboard and not self.recipient_search_page_visible(state)
+
+    def review_confirm_page_visible(self, state: UiState) -> bool:
+        return state.contains("Transfer amount", "Admin fee", "Free admin fee")
+
     def dismiss_home_popups(self) -> None:
         try:
             state = self.adb.dump_ui()
@@ -485,7 +512,7 @@ class MainGoPayTransferFlow:
         self.adb.tap_rel(state, 0.45, 0.38)
 
     def tap_recipient_result(self, state: UiState, full_phone: str) -> bool:
-        if state.contains("Review transfer", "Rp") or state.contains("Registered phone number", "Verify"):
+        if self.amount_entry_page_visible(state) or self.verify_prompt_visible(state):
             return True
         node = state.find("Tap here to transfer to")
         if node:
@@ -509,7 +536,7 @@ class MainGoPayTransferFlow:
         while time.time() < deadline:
             state = self.adb.dump_ui()
             last_text = state.text[:300]
-            if state.contains("Review transfer", "Rp", "Registered phone number", "Verify"):
+            if self.amount_entry_page_visible(state) or self.verify_prompt_visible(state):
                 return True
             if not state.contains("Transfer to new recipient", "Tap here to transfer to", full_phone[-6:]):
                 self.log.info("[main-transfer] recipient page changed after tapping result")
@@ -522,11 +549,13 @@ class MainGoPayTransferFlow:
         last_text = ""
         for attempt in range(1, 4):
             state = self.wait_state(
-                lambda s: s.contains("Transfer to new recipient", "Enter name or phone number", "Review transfer", "Rp"),
+                lambda s: self.recipient_search_page_visible(s)
+                or self.amount_entry_page_visible(s)
+                or self.verify_prompt_visible(s),
                 "GoPay recipient page",
                 timeout=25,
             )
-            if state.contains("Review transfer", "Rp"):
+            if self.amount_entry_page_visible(state):
                 self.log.info("[main-transfer] amount page opened while entering recipient")
                 return
             self.log.info("[main-transfer] recipient page ready; input phone %s attempt=%s", full_phone, attempt)
@@ -540,7 +569,7 @@ class MainGoPayTransferFlow:
             while time.time() < deadline:
                 state = self.adb.dump_ui()
                 last_text = state.text[:400]
-                if state.contains("Review transfer", "Rp", "Registered phone number", "Verify"):
+                if self.amount_entry_page_visible(state) or self.verify_prompt_visible(state):
                     return
                 if state.contains("Tap here to transfer to", full_phone[-6:], "This number isn't on your contact list"):
                     if self.tap_recipient_result(state, full_phone):
@@ -552,47 +581,107 @@ class MainGoPayTransferFlow:
 
     def verify_and_trust(self) -> None:
         state = self.wait_state(
-            lambda s: s.contains("Registered phone number", "Verify", "Review transfer", "Rp"),
+            lambda s: self.verify_prompt_visible(s) or self.amount_entry_page_visible(s),
             "Verify or amount page",
             timeout=25,
         )
-        if state.contains("Review transfer", "Rp") and not state.contains("Verify"):
+        if self.amount_entry_page_visible(state):
             self.log.info("[main-transfer] verify/trust skipped; amount page is already open")
             return
-        if not self.tap_text(state, "Verify"):
-            self.adb.tap_rel(state, 0.50, 0.50)
-        state = self.wait_state(
-            lambda s: s.contains("Do you trust the owner", "Trust, continue", "Trust", "Review transfer", "Rp"),
-            "Trust prompt or amount page",
-            timeout=25,
-        )
-        if state.contains("Review transfer", "Rp") and not state.contains("Trust"):
+        last_text = state.text[:400]
+        for attempt in range(1, 4):
+            self.log.info("[main-transfer] tap 'Verify' attempt=%s", attempt)
+            if not self.tap_lowest_text(state, "Verify"):
+                self.adb.tap_rel(state, 0.50, 0.50)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                state = self.adb.dump_ui()
+                last_text = state.text[:400]
+                if self.trust_prompt_visible(state) or self.amount_entry_page_visible(state):
+                    break
+                if self.technical_issue_visible(state):
+                    raise MainTransferTechnicalIssue(f"GoPay technical issue after Verify tap; screen={last_text!r}")
+                if self.gopay_error_visible(state):
+                    raise MainTransferError(f"GoPay error after Verify tap; screen={last_text!r}")
+                time.sleep(1)
+            if self.trust_prompt_visible(state) or self.amount_entry_page_visible(state):
+                break
+            self.log.warning("[main-transfer] Verify tap did not advance; retrying")
+        else:
+            raise MainTransferTechnicalIssue(f"Verify did not open Trust prompt or amount page after retries; screen={last_text!r}")
+        if self.amount_entry_page_visible(state):
             self.log.info("[main-transfer] trust skipped; amount page is already open")
             return
-        if not self.tap_lowest_text(state, "Trust, continue"):
-            self.adb.tap_rel(state, 0.50, 0.94)
+        for attempt in range(1, 4):
+            self.log.info("[main-transfer] tap lowest 'Trust, continue' attempt=%s", attempt)
+            if not self.tap_lowest_text(state, "Trust, continue"):
+                self.adb.tap_rel(state, 0.50, 0.94)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                state = self.adb.dump_ui()
+                last_text = state.text[:400]
+                if self.amount_entry_page_visible(state):
+                    return
+                if self.technical_issue_visible(state):
+                    raise MainTransferTechnicalIssue(f"GoPay technical issue after Trust tap; screen={last_text!r}")
+                if self.gopay_error_visible(state):
+                    raise MainTransferError(f"GoPay error after Trust tap; screen={last_text!r}")
+                time.sleep(1)
+            self.log.warning("[main-transfer] Trust tap did not open amount page; retrying")
+        raise MainTransferTechnicalIssue(f"Trust prompt did not open amount page after retries; screen={last_text!r}")
 
     def input_amount(self, amount: int) -> None:
-        state = self.wait_state(lambda s: s.contains("Review transfer") or s.contains("Rp"), "Amount page", timeout=25)
-        self.adb.clear_text(presses=8)
-        self.adb.digits(str(amount))
-        time.sleep(0.8)
-        state = self.adb.dump_ui()
-        if not self.tap_text(state, "Review transfer"):
-            self.adb.tap_rel(state, 0.50, 0.96)
+        last_text = ""
+        for attempt in range(1, 4):
+            state = self.wait_state(
+                lambda s: self.amount_entry_page_visible(s)
+                or self.review_confirm_page_visible(s)
+                or s.contains("Enter your PIN", "6-digit PIN"),
+                "Amount or review page",
+                timeout=25,
+            )
+            last_text = state.text[:400]
+            if self.review_confirm_page_visible(state) or state.contains("Enter your PIN", "6-digit PIN"):
+                self.log.info("[main-transfer] amount step skipped; review/PIN page already open")
+                return
+            self.log.info("[main-transfer] entering amount Rp%s attempt=%s", amount, attempt)
+            self.adb.clear_text(presses=8)
+            for digit in str(amount):
+                state = self.adb.dump_ui()
+                if not self.tap_exact_text(state, digit):
+                    self.adb.digits(digit)
+                time.sleep(0.25)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                state = self.adb.dump_ui()
+                last_text = state.text[:400]
+                if self.technical_issue_visible(state):
+                    raise MainTransferTechnicalIssue(f"GoPay technical issue while entering amount; screen={last_text!r}")
+                if self.bottom_exact_text_enabled(state, "Review transfer"):
+                    if not self.tap_bottom_exact_text(state, "Review transfer"):
+                        self.adb.tap_rel(state, 0.50, 0.96)
+                    review_deadline = time.time() + 15
+                    while time.time() < review_deadline:
+                        state = self.adb.dump_ui()
+                        last_text = state.text[:400]
+                        if state.contains("Enter your PIN", "6-digit PIN") or self.review_confirm_page_visible(state):
+                            return
+                        if self.technical_issue_visible(state):
+                            raise MainTransferTechnicalIssue(
+                                f"GoPay technical issue after Review transfer tap; screen={last_text!r}"
+                            )
+                        time.sleep(0.5)
+                    self.log.warning("[main-transfer] Review transfer did not open confirm page; retrying amount")
+                    break
+                time.sleep(0.5)
+            self.log.warning("[main-transfer] amount input did not enable Review transfer; retrying")
+        raise MainTransferError(f"amount input did not enable Review transfer after retries; screen={last_text!r}")
 
     def confirm_transfer(self) -> None:
         last_text = ""
         for attempt in range(1, 4):
             state = self.wait_state(
-                lambda s: s.contains(
-                    "Transfer amount",
-                    "Admin fee",
-                    "Free admin fee",
-                    "Transfer",
-                    "Enter your PIN",
-                    "6-digit PIN",
-                ),
+                lambda s: self.review_confirm_page_visible(s) or s.contains("Enter your PIN", "6-digit PIN"),
                 "Review page",
                 timeout=25,
             )
@@ -663,7 +752,14 @@ class MainGoPayTransferFlow:
         )
 
     def technical_issue_visible(self, state: UiState) -> bool:
-        return state.contains("Technical Issue", "technical error", "(C07)")
+        return state.contains(
+            "Technical Issue",
+            "technical error",
+            "(C07)",
+            "Oops, something's wrong",
+            "something's wrong",
+            "try again after some time",
+        )
 
     def dismiss_technical_issue(self, state: UiState) -> None:
         if self.tap_exact_text(state, "Try again", "Retry", "Got it", "Dismiss"):
