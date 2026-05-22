@@ -245,8 +245,8 @@ class PaymentService(payment_pb2_grpc.PaymentServiceServicer):
                 auth_cfg["prefer_session_refresh"] = auth_cfg.get("prefer_session_refresh", True)
 
             fingerprint_profile = build_fingerprint_profile(cfg.get("fingerprint") or {})
-            req_log("[payment] fingerprint profile %s", _fingerprint_log_summary(fingerprint_profile))
             cs_session = _build_chatgpt_session(auth_cfg, fingerprint_profile=fingerprint_profile)
+            req_log("[payment] fingerprint profile %s", _fingerprint_log_summary(fingerprint_profile))
 
             gopay_cfg = dict(cfg.get("gopay") or {})
             if request.country_code:

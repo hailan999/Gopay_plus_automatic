@@ -72,6 +72,44 @@ def _as_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+def _clean_proxy_env(env=None):
+    out = dict(os.environ if env is None else env)
+    for key in _PROXY_ENV_KEYS:
+        out.pop(key, None)
+    return out
+
+
+def _disable_env_proxy(session_obj):
+    try:
+        session_obj.trust_env = False
+    except Exception:
+        pass
+
+
+def _apply_proxy_to_session(session_obj, proxy_url: str):
+    _disable_env_proxy(session_obj)
+    if not hasattr(session_obj, "proxies"):
+        return
+    proxy_url = str(proxy_url or "").strip()
+    if proxy_url:
+        session_obj.proxies = {"http": proxy_url, "https": proxy_url}
+    else:
+        try:
+            session_obj.proxies = {}
+        except Exception:
+            pass
+
+
+def _urlopen_isolated(req, *, timeout: float, proxy_url: str = ""):
+    import urllib.request
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return opener.open(req, timeout=timeout)
+
+
 ACCOUNT_RETRY_ON_START_400 = _as_bool(
     ORCH_CFG.get(
         "account_retry_on_start_400",
@@ -459,8 +497,10 @@ def _wait_sms_api_otp(
         from curl_cffi import requests as cffi_requests  # type: ignore
         sess = cffi_requests.Session(impersonate="chrome136")
         if use_proxy and proxy_url:
-            sess.proxies = {"http": proxy_url, "https": proxy_url}
-            log.info("SMS API: proxy enabled")
+            _apply_proxy_to_session(sess, proxy_url)
+            log.info("SMS API: proxy enabled trust_env=%s", getattr(sess, "trust_env", "<unknown>"))
+        else:
+            _disable_env_proxy(sess)
     except Exception as e:
         log.warning("SMS API: curl_cffi unavailable, falling back to urllib: %s", e)
     
@@ -493,7 +533,8 @@ def _wait_sms_api_otp(
             else:
                 import urllib.request, urllib.error
                 req = urllib.request.Request(url, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                fallback_proxy = proxy_url if use_proxy else ""
+                with _urlopen_isolated(req, timeout=8, proxy_url=fallback_proxy) as resp:
                     body = resp.read().decode(errors="replace")
             
             # ═══ 解析响应，提取 6 位 OTP ═══
@@ -556,14 +597,17 @@ def _request_sms_api_resend(activation_id: str) -> bool:
             from curl_cffi import requests as cffi_requests  # type: ignore
             sess = cffi_requests.Session(impersonate="chrome145")
             if use_proxy and proxy_url:
-                sess.proxies = {"http": proxy_url, "https": proxy_url}
+                _apply_proxy_to_session(sess, proxy_url)
+            else:
+                _disable_env_proxy(sess)
             resp = sess.get(url, headers={"Accept": "text/plain, */*"}, timeout=12)
             body = resp.text[:160]
             ok = resp.status_code < 400
         except Exception:
             import urllib.request
             req = urllib.request.Request(url, headers={"Accept": "text/plain, */*"})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            fallback_proxy = proxy_url if use_proxy else ""
+            with _urlopen_isolated(req, timeout=12, proxy_url=fallback_proxy) as resp:
                 body = resp.read().decode(errors="replace")[:160]
                 ok = 200 <= resp.status < 400
         log.info("SMS API: setStatus=3 activation=%s ok=%s response=%s", activation_id, ok, body)
@@ -593,7 +637,7 @@ def _wait_whatsapp_otp(issued_after: int, timeout: int) -> str:
                 f"--python_out={stub_dir}",
                 f"--grpc_python_out={stub_dir}",
                 str(otp_proto_dir / "otp.proto"),
-            ], check=True)
+            ], check=True, env=_clean_proxy_env())
         
         sys.path.insert(0, str(stub_dir))
         import otp_pb2

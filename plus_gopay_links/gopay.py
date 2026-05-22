@@ -34,7 +34,9 @@ Flow (15 steps):
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as _dt
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +46,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -60,6 +63,14 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 _IMPERSONATE_FALLBACK = "chrome146"
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+def _clean_proxy_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    out = dict(os.environ if env is None else env)
+    for key in _PROXY_ENV_KEYS:
+        out.pop(key, None)
+    return out
 
 
 def _curl_cffi_impersonates() -> set[str]:
@@ -123,8 +134,39 @@ def _new_session(impersonate: str = "chrome145") -> Any:
                 impersonate,
                 normalized,
             )
-        return _CurlCffiSession(impersonate=normalized)
-    return requests.Session()
+        sess = _CurlCffiSession(impersonate=normalized)
+    else:
+        sess = requests.Session()
+    _disable_env_proxy(sess)
+    return sess
+
+
+def _disable_env_proxy(session_obj: Any) -> None:
+    try:
+        session_obj.trust_env = False
+    except Exception:
+        pass
+
+
+def _normalize_proxy_for_session(proxy_url: str) -> str:
+    proxy_url = str(proxy_url or "").strip()
+    if _CurlCffiSession is not None and proxy_url.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
+
+
+def _apply_proxy_to_session(session_obj: Any, proxy_url: str) -> None:
+    _disable_env_proxy(session_obj)
+    if not hasattr(session_obj, "proxies"):
+        return
+    proxy_url = _normalize_proxy_for_session(proxy_url)
+    if proxy_url:
+        session_obj.proxies = {"http": proxy_url, "https": proxy_url}
+    else:
+        try:
+            session_obj.proxies = {}
+        except Exception:
+            pass
 
 
 def _mask_secret(value: str, left: int = 8, right: int = 6) -> str:
@@ -276,27 +318,53 @@ def build_fingerprint_profile(raw_cfg: Optional[dict[str, Any]] = None) -> dict[
     base["muid"] = uuid.uuid4().hex
     base["sid"] = uuid.uuid4().hex
     base["device_id"] = str(uuid.uuid4())
+    base["profile_device_id"] = base["device_id"]
     base["client_session_id"] = str(uuid.uuid4())
     base["stripe_js_id"] = str(uuid.uuid4())
     base["elements_session_id"] = f"elements_session_{uuid.uuid4().hex[:11]}"
+    base["stripe_fingerprint"] = {
+        "guid": base["guid"],
+        "muid": base["muid"],
+        "sid": base["sid"],
+        "source": "local_fallback",
+        "registered": False,
+    }
+    base["browser_js_visible"] = False
     return base
 
 
 def _fingerprint_log_summary(fp: dict[str, Any]) -> str:
+    profile_device = str(fp.get("profile_device_id") or fp.get("device_id") or "")
+    actual_device = str(fp.get("actual_oai_device_id") or "")
+    cookie_device = str(fp.get("cookie_oai_did") or "")
+    stripe_fp = fp.get("stripe_fingerprint") if isinstance(fp.get("stripe_fingerprint"), dict) else {}
+    stripe_source = stripe_fp.get("source") or fp.get("stripe_fingerprint_source") or "local_fallback"
+    stripe_registered = stripe_fp.get("registered")
     return (
         f"guid={_mask_secret(str(fp.get('guid', '')), 8, 6)} "
         f"muid={_mask_secret(str(fp.get('muid', '')), 8, 6)} "
         f"sid={_mask_secret(str(fp.get('sid', '')), 8, 6)} "
+        f"stripe_source={stripe_source} registered={stripe_registered} "
         f"ua={fp.get('user_agent')} | "
         f"accept_language={fp.get('accept_language')} | "
         f"locale={fp.get('locale')} language={fp.get('language')} "
         f"timezone={fp.get('timezone')} tz_offset={fp.get('tz_offset')} | "
         f"screen={fp.get('screen_width')}x{fp.get('screen_height')} "
         f"viewport={fp.get('viewport_width')}x{fp.get('viewport_height')} "
-        f"dpr={fp.get('dpr')} color_depth={fp.get('color_depth')} | "
-        f"device_id={_mask_secret(str(fp.get('device_id', '')), 8, 6)} "
+        f"dpr={fp.get('dpr')} color_depth={fp.get('color_depth')} browser_js={fp.get('browser_js_visible')} | "
+        f"profile_device_id={_mask_secret(profile_device, 8, 6)} "
+        f"actual_oai_device_id={_mask_secret(actual_device, 8, 6)} "
+        f"cookie_oai_did={_mask_secret(cookie_device, 8, 6)} "
         f"impersonate={fp.get('impersonate')}"
     )
+
+
+def _session_proxy_summary(session_obj: Any) -> str:
+    proxies = getattr(session_obj, "proxies", {}) or {}
+    if not isinstance(proxies, dict):
+        return "<unknown>"
+    http_proxy = str(proxies.get("https") or proxies.get("http") or "")
+    return _mask_proxy_url(http_proxy)
 
 
 # ──────────────────────────── constants ───────────────────────────
@@ -340,6 +408,20 @@ HTTP_RETRY_ERROR_HINTS = (
     "openssl_internal",
     "invalid library",
 )
+_STRIPE_M6_PLUGINS = (
+    "PDF Viewer,Chrome PDF Viewer,Chromium PDF Viewer,Microsoft Edge PDF Viewer,"
+    "WebKit built-in PDF"
+)
+_STRIPE_M6_CANVAS = (
+    "8cfe4d9b0d5d2f64c8a754b49f0ed6f4",
+    "b4b75b5f64bff3a68d4fd4a7e7b4c2ef",
+    "6d72a5fbe4e66c3c0a3a123b7f2d9bb1",
+)
+_STRIPE_M6_AUDIO = (
+    "d331ca493eb692cfcd19ae5db713ad4b",
+    "a7c5f72e1b3d4e8f9c0d2a6b7e8f1c3d",
+    "e4b8d6f2a0c3d5e7f9b1c3d5e7f9a0b2",
+)
 # 429 "There's a technical error" 风控触发条件：带 Authorization 的 SDK 路径
 # 在某些 IP / 高频场景必现。剥掉 Authorization 头同 endpoint 重发即返回 201
 # + activation_link_url（实测 + 反向工程参考实现确认）。
@@ -370,6 +452,198 @@ class GoPayPINRejected(GoPayError):
 
 class MidtransPendingTimeout(GoPayError):
     pass
+
+
+def _bool_cfg(cfg: dict, key: str, default: bool) -> bool:
+    value = (cfg or {}).get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _stripe_m6_encode(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"))
+    return base64.b64encode(urllib.parse.quote(raw, safe="").encode()).decode()
+
+
+def _stripe_b64url(n: int = 32) -> str:
+    return base64.urlsafe_b64encode(os.urandom(n)).rstrip(b"=").decode()
+
+
+def _set_stripe_fingerprint_result(
+    fp: dict[str, Any],
+    *,
+    source: str,
+    registered: bool,
+    status: str = "",
+) -> None:
+    nested = {
+        "guid": str(fp.get("guid") or ""),
+        "muid": str(fp.get("muid") or ""),
+        "sid": str(fp.get("sid") or ""),
+        "source": source,
+        "registered": bool(registered),
+    }
+    if status:
+        nested["registration_status"] = status
+    fp["stripe_fingerprint"] = nested
+    fp["stripe_fingerprint_source"] = source
+    fp["stripe_fingerprint_registered"] = bool(registered)
+
+
+def register_stripe_fingerprint(
+    sess: Any,
+    fp: dict[str, Any],
+    *,
+    timeout: float = 10.0,
+    log: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Best-effort Stripe m.stripe.com/6 registration for the current flow profile."""
+    _disable_env_proxy(sess)
+    guid = str(fp.get("guid") or uuid.uuid4().hex)
+    muid = str(fp.get("muid") or uuid.uuid4().hex)
+    sid = str(fp.get("sid") or uuid.uuid4().hex)
+    fp_id = uuid.uuid4().hex
+    sw = int(fp.get("screen_width") or 1920)
+    sh = int(fp.get("screen_height") or 1080)
+    vh = int(fp.get("viewport_height") or max(640, sh - 72))
+    dpr = fp.get("dpr") or 1
+    color_depth = int(fp.get("color_depth") or 24)
+    cpu = random.choice([4, 8, 12, 16])
+    canvas_fp = random.choice(_STRIPE_M6_CANVAS)
+    audio_fp = random.choice(_STRIPE_M6_AUDIO)
+    user_agent = str(fp.get("user_agent") or getattr(sess, "headers", {}).get("User-Agent") or "")
+    language = str(fp.get("language") or fp.get("locale") or "en-US")
+    platform = str(fp.get("platform") or "Win32")
+
+    def _build_full(v2: int, include_ids: bool) -> dict:
+        s1, s2, s3, s4, s5 = (_stripe_b64url() for _ in range(5))
+        ts_now = int(time.time() * 1000)
+        return {
+            "v2": v2,
+            "id": fp_id,
+            "t": round(random.uniform(3, 120), 1),
+            "tag": "$npm_package_version",
+            "src": "js",
+            "a": {
+                "a": {"v": "true", "t": 0},
+                "b": {"v": "true", "t": 0},
+                "c": {"v": language, "t": 0},
+                "d": {"v": platform, "t": 0},
+                "e": {"v": _STRIPE_M6_PLUGINS, "t": round(random.uniform(0, 0.5), 1)},
+                "f": {"v": f"{sw}w_{vh}h_{color_depth}d_{dpr}r", "t": 0},
+                "g": {"v": str(cpu), "t": 0},
+                "h": {"v": "false", "t": 0},
+                "i": {"v": "sessionStorage-enabled, localStorage-enabled", "t": round(random.uniform(0.5, 2), 1)},
+                "j": {"v": canvas_fp, "t": round(random.uniform(5, 120), 1)},
+                "k": {"v": "", "t": 0},
+                "l": {"v": user_agent, "t": 0},
+                "m": {"v": "", "t": 0},
+                "n": {"v": "false", "t": round(random.uniform(3, 50), 1)},
+                "o": {"v": audio_fp, "t": round(random.uniform(20, 30), 1)},
+            },
+            "b": {
+                "a": f"https://{s1}.{s2}.{s3}/",
+                "b": f"https://{s1}.{s3}/{s4}/{s5}/{_stripe_b64url()}",
+                "c": _stripe_b64url(),
+                "d": muid if include_ids else "NA",
+                "e": sid if include_ids else "NA",
+                "f": False,
+                "g": True,
+                "h": True,
+                "i": ["location"],
+                "j": [],
+                "n": round(random.uniform(800, 2000), 1),
+                "u": "chatgpt.com",
+                "v": "auth.openai.com",
+                "w": f"{ts_now}:{hashlib.sha256(os.urandom(32)).hexdigest()}",
+            },
+            "h": os.urandom(10).hex(),
+        }
+
+    def _build_mouse(source: str) -> dict:
+        return {
+            "muid": muid,
+            "sid": sid,
+            "url": f"https://{_stripe_b64url()}.{_stripe_b64url()}/{_stripe_b64url()}",
+            "source": source,
+            "data": [random.randint(1, 8) for _ in range(10)],
+        }
+
+    headers = {
+        "User-Agent": user_agent,
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Accept": "*/*",
+        "Origin": "https://m.stripe.network",
+        "Referer": "https://m.stripe.network/",
+    }
+    attempts: dict[str, str] = {}
+    log(
+        "[gopay] stripe fingerprint register start "
+        f"trust_env={getattr(sess, 'trust_env', '<unknown>')} "
+        f"screen={sw}x{sh} viewport={sw}x{vh} dpr={dpr} color_depth={color_depth} "
+        "browser_js=false"
+    )
+    try:
+        r1 = sess.post(
+            "https://m.stripe.com/6",
+            data=_stripe_m6_encode(_build_full(1, False)),
+            headers=headers,
+            timeout=timeout,
+        )
+        attempts["full_v1"] = str(getattr(r1, "status_code", ""))
+        if r1.status_code == 200:
+            data = r1.json()
+            guid = str(data.get("guid") or guid)
+            muid = str(data.get("muid") or muid)
+            sid = str(data.get("sid") or sid)
+    except Exception as exc:
+        attempts["full_v1"] = f"error:{str(exc)[:80]}"
+
+    try:
+        r2 = sess.post(
+            "https://m.stripe.com/6",
+            data=_stripe_m6_encode(_build_full(2, True)),
+            headers=headers,
+            timeout=timeout,
+        )
+        attempts["full_v2"] = str(getattr(r2, "status_code", ""))
+        if r2.status_code == 200:
+            data = r2.json()
+            guid = str(data.get("guid") or guid)
+    except Exception as exc:
+        attempts["full_v2"] = f"error:{str(exc)[:80]}"
+
+    for key, source in (("mouse_v2", "mouse-timings-10-v2"), ("mouse", "mouse-timings-10")):
+        try:
+            r = sess.post(
+                "https://m.stripe.com/6",
+                data=_stripe_m6_encode(_build_mouse(source)),
+                headers=headers,
+                timeout=timeout,
+            )
+            attempts[key] = str(getattr(r, "status_code", ""))
+        except Exception as exc:
+            attempts[key] = f"error:{str(exc)[:80]}"
+
+    fp.update({"guid": guid, "muid": muid, "sid": sid})
+    registered = attempts.get("full_v1") == "200" or attempts.get("full_v2") == "200"
+    source = "stripe_m6_ok" if registered else "local_fallback"
+    _set_stripe_fingerprint_result(
+        fp,
+        source=source,
+        registered=registered,
+        status=";".join(f"{k}={v}" for k, v in attempts.items()),
+    )
+    log(
+        "[gopay] stripe fingerprint register done "
+        f"source={source} registered={registered} "
+        f"guid={_mask_secret(guid)} muid={_mask_secret(muid)} sid={_mask_secret(sid)} "
+        f"attempts={attempts}"
+    )
+    return fp
 
 
 # ──────────────────────────── core ────────────────────────────────
@@ -431,6 +705,9 @@ class GoPayCharger:
             5.0,
             _float_cfg(gopay_cfg, "chatgpt_checkout_timeout_s", DEFAULT_CHECKOUT_TIMEOUT),
         )
+        self.register_stripe_m6 = _bool_cfg(self.fingerprint, "register_stripe_m6", True)
+        self.stripe_m6_timeout_s = max(2.0, _float_cfg(self.fingerprint, "stripe_m6_timeout_s", 10.0))
+        self._stripe_m6_attempted = False
         self.otp_provider = otp_provider
         self.log = log
         self.log(
@@ -453,17 +730,15 @@ class GoPayCharger:
             "sec-ch-ua-platform": str(self.fingerprint.get("sec_ch_ua_platform") or '"Windows"'),
         })
         if proxy:
-            try:
-                self.cs.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
-            try:
-                self.ext.proxies = {"http": proxy, "https": proxy}
-            except Exception:
-                pass
+            _apply_proxy_to_session(self.cs, proxy)
+            _apply_proxy_to_session(self.ext, proxy)
+        else:
+            _disable_env_proxy(self.cs)
+            _disable_env_proxy(self.ext)
         self.proxy = proxy or ""
         self.payment_proxy = (payment_proxy or "").strip()
         self._payment_proxy_applied = False
+        self._log_context("init")
 
     def _apply_payment_proxy(self) -> None:
         if self._payment_proxy_applied:
@@ -474,15 +749,92 @@ class GoPayCharger:
             self.log(f"[gopay] payment proxy unchanged: {_mask_proxy_url(self.proxy)}")
         else:
             try:
-                self.ext.proxies = {"http": self.payment_proxy, "https": self.payment_proxy}
+                _apply_proxy_to_session(self.ext, self.payment_proxy)
                 active_proxy = self.payment_proxy
                 self.log(f"[gopay] switched payment session proxy to {_mask_proxy_url(self.payment_proxy)}")
             except Exception as e:
                 self.log(f"[gopay] payment proxy switch failed: {e}")
         self.log(
             f"[gopay] payment stage fingerprint: {_fingerprint_log_summary(self.fingerprint)} "
-            f"proxy={_mask_proxy_url(active_proxy)}"
+            f"proxy={_mask_proxy_url(active_proxy)} trust_env={getattr(self.ext, 'trust_env', '<unknown>')}"
         )
+        self._ensure_stripe_fingerprint_registered()
+        self._log_context("payment_proxy_applied")
+
+    def _log_context(self, stage: str) -> None:
+        cookie_header = str(self.cs.headers.get("Cookie") or "")
+        header_device = str(self.cs.headers.get("oai-device-id") or "")
+        cookie_device = _extract_cookie_value(cookie_header, "oai-did")
+        profile_device = str(self.fingerprint.get("profile_device_id") or "")
+        actual_device = str(self.fingerprint.get("actual_oai_device_id") or "")
+        stripe_fp = self.fingerprint.get("stripe_fingerprint")
+        if not isinstance(stripe_fp, dict):
+            stripe_fp = {}
+        self.log(
+            "[context] "
+            f"stage={stage} "
+            f"checkout_proxy={_session_proxy_summary(self.cs)} "
+            f"payment_proxy={_session_proxy_summary(self.ext)} "
+            f"configured_proxy={_mask_proxy_url(self.proxy)} "
+            f"configured_payment_proxy={_mask_proxy_url(self.payment_proxy)} "
+            f"checkout_trust_env={getattr(self.cs, 'trust_env', '<unknown>')} "
+            f"payment_trust_env={getattr(self.ext, 'trust_env', '<unknown>')}"
+        )
+        self.log(
+            "[context] "
+            f"stage={stage} "
+            f"profile_device_id={_mask_secret(profile_device)} "
+            f"actual_oai_device_id={_mask_secret(actual_device)} "
+            f"header_oai_device_id={_mask_secret(header_device)} "
+            f"cookie_oai_did={_mask_secret(cookie_device)} "
+            f"header_cookie_match={bool(header_device and cookie_device and header_device == cookie_device)} "
+            f"profile_actual_match={bool(profile_device and actual_device and profile_device == actual_device)}"
+        )
+        self.log(
+            "[context] "
+            f"stage={stage} "
+            f"stripe_source={stripe_fp.get('source') or '<none>'} "
+            f"stripe_registered={stripe_fp.get('registered')} "
+            f"stripe_status={stripe_fp.get('registration_status') or '<none>'} "
+            f"guid={_mask_secret(str(self.fingerprint.get('guid') or ''))} "
+            f"muid={_mask_secret(str(self.fingerprint.get('muid') or ''))} "
+            f"sid={_mask_secret(str(self.fingerprint.get('sid') or ''))}"
+        )
+        self.log(
+            "[context] "
+            f"stage={stage} "
+            f"locale={self.fingerprint.get('locale')} "
+            f"language={self.fingerprint.get('language')} "
+            f"accept_language={self.fingerprint.get('accept_language')} "
+            f"timezone={self.fingerprint.get('timezone')} "
+            f"screen={self.fingerprint.get('screen_width')}x{self.fingerprint.get('screen_height')} "
+            f"viewport={self.fingerprint.get('viewport_width')}x{self.fingerprint.get('viewport_height')} "
+            f"dpr={self.fingerprint.get('dpr')} "
+            f"color_depth={self.fingerprint.get('color_depth')} "
+            f"browser_js={self.fingerprint.get('browser_js_visible')}"
+        )
+
+    def _ensure_stripe_fingerprint_registered(self) -> None:
+        if self._stripe_m6_attempted:
+            return
+        self._stripe_m6_attempted = True
+        if not self.register_stripe_m6:
+            _set_stripe_fingerprint_result(
+                self.fingerprint,
+                source="local_fallback",
+                registered=False,
+                status="disabled",
+            )
+            self.log("[gopay] stripe fingerprint register skipped: disabled")
+            self._log_context("stripe_m6_skipped")
+            return
+        register_stripe_fingerprint(
+            self.ext,
+            self.fingerprint,
+            timeout=self.stripe_m6_timeout_s,
+            log=self.log,
+        )
+        self._log_context("stripe_m6_done")
 
     def close(self) -> None:
         for sess in (self.cs, self.ext):
@@ -556,6 +908,7 @@ class GoPayCharger:
         self.log(
             "[gopay] checkout create request "
             f"proxy={_mask_proxy_url(self.proxy)} "
+            f"trust_env={getattr(self.cs, 'trust_env', '<unknown>')} "
             f"headers={_safe_header_summary(self.cs.headers)} "
             f"body_country={body['billing_details']['country']} "
             f"body_currency={body['billing_details']['currency']}",
@@ -600,8 +953,26 @@ class GoPayCharger:
             "billing_details[address][state]": billing.get("state") or "Lampung",
             "type": "gopay",
             "client_attribution_metadata[checkout_session_id]": cs_id,
+            "client_attribution_metadata[client_session_id]": str(self.fingerprint.get("client_session_id")),
+            "client_attribution_metadata[merchant_integration_source]": "elements",
+            "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
+            "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
+            "guid": str(self.fingerprint.get("guid")),
+            "muid": str(self.fingerprint.get("muid")),
+            "sid": str(self.fingerprint.get("sid")),
             "key": stripe_pk,
         }
+        stripe_fp = self.fingerprint.get("stripe_fingerprint")
+        self.log(
+            "[gopay] stripe payment_method request "
+            f"cs={_mask_secret(cs_id, left=12, right=8)} "
+            f"stripe_fp_source={(stripe_fp or {}).get('source') if isinstance(stripe_fp, dict) else '<none>'} "
+            f"registered={(stripe_fp or {}).get('registered') if isinstance(stripe_fp, dict) else '<none>'} "
+            f"guid={_mask_secret(str(body['guid']))} "
+            f"muid={_mask_secret(str(body['muid']))} "
+            f"sid={_mask_secret(str(body['sid']))} "
+            f"proxy={_mask_proxy_url(self.payment_proxy or self.proxy or '')}"
+        )
         r = self._post(
             self.ext,
             "https://api.stripe.com/v1/payment_methods",
@@ -637,7 +1008,8 @@ class GoPayCharger:
             f"timezone={body['browser_timezone']} "
             f"stripe_js_id={_mask_secret(str(body['elements_session_client[stripe_js_id]']), left=8, right=6)} "
             f"elements_locale={body['elements_session_client[locale]']} "
-            f"proxy={_mask_proxy_url(self.payment_proxy or self.proxy or '')}"
+            f"proxy={_mask_proxy_url(self.payment_proxy or self.proxy or '')} "
+            f"trust_env={getattr(self.ext, 'trust_env', '<unknown>')}"
         )
         r = self._post(
             self.ext,
@@ -719,6 +1091,18 @@ class GoPayCharger:
             body["js_checksum"] = self.runtime["js_checksum"]
         if self.runtime.get("rv_timestamp"):
             body["rv_timestamp"] = self.runtime["rv_timestamp"]
+        stripe_fp = self.fingerprint.get("stripe_fingerprint")
+        self.log(
+            "[gopay] stripe confirm request "
+            f"cs={_mask_secret(cs_id, left=12, right=8)} "
+            f"stripe_fp_source={(stripe_fp or {}).get('source') if isinstance(stripe_fp, dict) else '<none>'} "
+            f"registered={(stripe_fp or {}).get('registered') if isinstance(stripe_fp, dict) else '<none>'} "
+            f"guid={_mask_secret(str(body['guid']))} "
+            f"muid={_mask_secret(str(body['muid']))} "
+            f"sid={_mask_secret(str(body['sid']))} "
+            f"elements_session={_mask_secret(str(body['elements_session_client[session_id]']))} "
+            f"proxy={_mask_proxy_url(self.payment_proxy or self.proxy or '')}"
+        )
         r = self._post(
             self.ext,
             f"https://api.stripe.com/v1/payment_pages/{cs_id}/confirm",
@@ -1517,6 +1901,12 @@ class GoPayCharger:
     def _chatgpt_verify(self, cs_id: str) -> dict:
         """Poll chatgpt verify until plan is active."""
         deadline = time.time() + 60
+        self.log(
+            "[gopay] chatgpt verify start "
+            f"proxy={_mask_proxy_url(self.proxy)} "
+            f"trust_env={getattr(self.cs, 'trust_env', '<unknown>')}"
+        )
+        self._log_context("chatgpt_verify")
         while time.time() < deadline:
             r = self._get(
                 self.cs,
@@ -1893,7 +2283,7 @@ def whatsapp_http_otp_provider(
     def provider() -> str:
         issued_after = time.time() - max(0.0, issued_after_slack_s)
         deadline = time.time() + timeout
-        sess = requests.Session()
+        sess = _new_session("chrome145")
         base_params = dict(params or {})
         last_error = ""
         log(f"[gopay] waiting WhatsApp OTP from relay: {url}")
@@ -1960,6 +2350,7 @@ def command_otp_provider(
                     text=True,
                     timeout=min(20.0, max(2.0, interval + 1.0)),
                     check=False,
+                    env=_clean_proxy_env(),
                 )
                 text = (proc.stdout or "") + "\n" + (proc.stderr or "")
                 code = _extract_otp_from_text(text, code_regex=code_regex)
@@ -2144,7 +2535,14 @@ def _build_chatgpt_session(auth_cfg: dict, fingerprint_profile: Optional[dict[st
     access_token = (auth_cfg.get("access_token") or "").strip()
     cookie_header = (auth_cfg.get("cookie_header") or "").strip()
     fp = fingerprint_profile or build_fingerprint_profile()
-    device_id = (auth_cfg.get("device_id") or "").strip() or str(fp.get("device_id") or uuid.uuid4())
+    cookie_oai_did = _extract_cookie_value(cookie_header, "oai-did")
+    auth_device_id = (auth_cfg.get("device_id") or "").strip()
+    profile_device_id = str(fp.get("profile_device_id") or fp.get("device_id") or "")
+    device_id = cookie_oai_did or auth_device_id or profile_device_id or str(uuid.uuid4())
+    fp["profile_device_id"] = profile_device_id or device_id
+    fp["cookie_oai_did"] = cookie_oai_did
+    fp["actual_oai_device_id"] = device_id
+    fp["device_id"] = device_id
     user_agent = auth_cfg.get("user_agent") or fp.get("user_agent") or (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -2292,8 +2690,8 @@ def main():
         auth_cfg.pop("access_token", None)
     try:
         fingerprint_profile = build_fingerprint_profile(cfg.get("fingerprint") or {})
-        print(f"[指纹] CLI flow profile: {_fingerprint_log_summary(fingerprint_profile)}")
         cs_session = _build_chatgpt_session(auth_cfg, fingerprint_profile=fingerprint_profile)
+        print(f"[指纹] CLI flow profile: {_fingerprint_log_summary(fingerprint_profile)}")
     except GoPayError as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(2)
