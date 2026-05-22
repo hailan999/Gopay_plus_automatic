@@ -20,13 +20,21 @@
     },
     "prepare_emulator": {
       "enabled": true,
+      "___emulator_hint___": "ldplayer=原雷电自动创建/删除；bluestacks=通过多开器创建/启动实例并用 HD-Adb.exe 安装/推送；adb=通用已连接设备",
+      "emulator": "ldplayer",
       "name": "gopay-auto-1",
       "index": "",
       "create": true,
       "unique_name": true,
       "ld_dir": "E:\\leidian\\LDPlayer9",
+      "bs_dir": "C:\\Program Files\\BlueStacks_nxt_cn",
+      "bs_image": "Pie64",
+      "bs_clone_from": "",
+      "adb_path": "",
+      "device": "",
+      "connect_ports": [5555, 5557, 5559, 5561, 7555],
       "mt_apk": "C:\\Users\\Administrator\\Downloads\\MT2.26.4.apk",
-      "gopay_apks": "C:\\Users\\Administrator\\Downloads\\GoPay_2.7.0.apks",
+      "gopay_apks": "C:\\Users\\Administrator\\Downloads\\GoPay_2.8.0.apks",
       "width": 1080,
       "height": 1920,
       "dpi": 480,
@@ -41,7 +49,9 @@
     "main_transfer": {
       "enabled": true,
       "___hint___": "支付 link 完成后，用主模拟器给本次 GoPay 号码转账；device 留空时使用 protected_emulators 的第一个 device/index",
+      "emulator": "ldplayer",
       "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+      "bs_dir": "C:\\Program Files\\BlueStacks_nxt_cn",
       "device": "",
       "package": "com.gojek.gopay",
       "pin": "211314",
@@ -80,7 +90,9 @@
     "language": "id-ID",
     "accept_language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     "timezone": "Asia/Jakarta",
-    "tz_offset": -420
+    "tz_offset": -420,
+    "register_stripe_m6": true,
+    "stripe_m6_timeout_s": 10
   },
   "billing": {
     "country": "ID",

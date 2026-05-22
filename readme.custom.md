@@ -306,7 +306,7 @@ PIN 设置成功后，脚本会读取 `config.json` 里的 `gopay.get_rp_link`�
 
 ### 9.1 准备新模拟器
 
-`gopay_prepare_emulator.py` 用来做注册前置准备：新建/复用一个雷电模拟器，设置分辨率 `1080x1920x480`，安装 `MT2.26.4.apk`，把 `GoPay_2.7.0.apks` 放到 `/sdcard/Pictures/`，并把 `.apks` 里的 split APK 直接通过 `adb install-multiple` 安装好。这样不需要在 MT 管理器里手动点安装。
+`gopay_prepare_emulator.py` 用来做注册前置准备：新建/复用一个雷电模拟器，设置分辨率 `1080x1920x480`，安装 `MT2.26.4.apk`，把 `GoPay_2.8.0.apks` 放到 `/sdcard/Pictures/`，并把 `.apks` 里的 split APK 直接通过 `adb install-multiple` 安装好。这样不需要在 MT 管理器里手动点安装。
 
 新建一个模拟器并准备：
 
@@ -323,10 +323,23 @@ PIN 设置成功后，脚本会读取 `config.json` 里的 `gopay.get_rp_link`�
 默认文件路径：
 
 - MT 管理器：`C:\Users\Administrator\Downloads\MT2.26.4.apk`
-- GoPay APKS：`C:\Users\Administrator\Downloads\GoPay_2.7.0.apks`
+- GoPay APKS：`C:\Users\Administrator\Downloads\GoPay_2.8.0.apks`
 - 雷电目录：`E:\leidian\LDPlayer9`
+- 蓝叠目录：`C:\Program Files\BlueStacks_nxt_cn`
 
 如果文件放在别处，用 `--mt-apk` / `--gopay-apks` 指定。
+
+蓝叠模式会读取 `bluestacks.conf` 里的实例名、显示名和 ADB 端口。传 `--create` 且找不到指定实例时，会调用蓝叠多开器创建新实例，再启动并通过 `HD-Adb.exe` 连接、推送和安装：
+
+```powershell
+.\.venv\Scripts\python.exe .\gopay_prepare_emulator.py --emulator bluestacks --name gopay-auto-1 --create --bs-image Pie64 --open-mt
+```
+
+如果只想复用已经打开的蓝叠实例，可以指定实例名或 ADB 设备：
+
+```powershell
+.\.venv\Scripts\python.exe .\gopay_register_adb.py --emulator bluestacks --device 127.0.0.1:5555
+```
 
 相关配置示例：
 

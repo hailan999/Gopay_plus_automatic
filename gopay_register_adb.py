@@ -30,14 +30,16 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 import clash_verge_rotator
+import emulator_support
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
-DEFAULT_ADB = Path(r"E:\leidian\LDPlayer9\adb.exe")
-DEFAULT_LD_DIR = Path(r"E:\leidian\LDPlayer9")
+DEFAULT_ADB = emulator_support.DEFAULT_LD_DIR / "adb.exe"
+DEFAULT_LD_DIR = emulator_support.DEFAULT_LD_DIR
+DEFAULT_BS_DIR = emulator_support.DEFAULT_BLUESTACKS_DIR
 DEFAULT_MT_APK = Path(r"C:\Users\Administrator\Downloads\MT2.26.4.apk")
-DEFAULT_GOPAY_APKS = Path(r"C:\Users\Administrator\Downloads\GoPay_2.7.0.apks")
+DEFAULT_GOPAY_APKS = Path(r"C:\Users\Administrator\Downloads\GoPay_2.8.0.apks")
 LOG_DIR = ROOT / "logs"
 STEP_DIR = LOG_DIR / "gopay_register_steps"
 USED_OTPS_PATH = LOG_DIR / "herosms_used_otps.json"
@@ -939,12 +941,17 @@ class Adb:
         )
 
     def check(self, args: list[str], timeout: int = 20) -> str:
-        proc = self.raw(args, timeout=timeout)
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
-            stdout = (proc.stdout or "").strip()
-            raise RegisterError(f"adb command failed: {' '.join(args)} :: {stderr or stdout}")
-        return proc.stdout or ""
+        last = ""
+        for attempt in range(3):
+            proc = self.raw(args, timeout=timeout)
+            if proc.returncode == 0:
+                return proc.stdout or ""
+            last = emulator_support.adb_error_text(proc)
+            if attempt >= 2 or not emulator_support.is_transient_adb_error(last):
+                break
+            self.log.warning("ADB command failed transiently (%s); recovering and retrying", last)
+            emulator_support.recover_adb(Path(self.adb_path), self.device, self.log)
+        raise RegisterError(f"adb command failed: {' '.join(args)} :: {last}")
 
     def shell(self, command: str, timeout: int = 20) -> str:
         return self.check(["shell", command], timeout=timeout)
@@ -994,10 +1001,14 @@ class Adb:
             time.sleep(0.08)
 
     def wm_size(self) -> tuple[int, int]:
-        out = self.shell("wm size", timeout=8)
+        try:
+            out = self.shell("wm size", timeout=8)
+        except RegisterError as exc:
+            self.log.warning("wm size failed, using 1080x1920 fallback: %s", exc)
+            return 1080, 1920
         match = re.search(r"Physical size:\s*(\d+)x(\d+)", out)
         if not match:
-            return 560, 1000
+            return 1080, 1920
         return int(match.group(1)), int(match.group(2))
 
     def screenshot(self, path: Path) -> None:
@@ -1976,6 +1987,12 @@ class GoPayRegisterFlow:
         return digit_count >= 8
 
     def maybe_start_language_flow(self, state: UiState) -> bool:
+        if state.contains("开启设备位置信息功能", "Google 的位置信息服务"):
+            if self.tap_exact_text(state, "不用了"):
+                return True
+            self.log.info("Google location prompt skip button not found; tapping fallback")
+            self.adb.tap_rel(state, 0.60, 0.60)
+            return True
         if state.contains("Izinkan akses lokasi", "Oke, lanjut", "Perlindungan dari penipuan"):
             if self.tap_text(state, "Nanti aja"):
                 return True
@@ -2333,20 +2350,16 @@ def classify_state(state: UiState) -> str:
     return "unknown"
 
 
-def find_adb_path(value: str) -> Path:
-    candidates: list[Path] = []
-    if value:
-        candidates.append(Path(value))
-    candidates.append(DEFAULT_ADB)
-    env_path = os.environ.get("PATH", "")
-    exe = "adb.exe" if os.name == "nt" else "adb"
-    for folder in env_path.split(os.pathsep):
-        if folder:
-            candidates.append(Path(folder) / exe)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise RegisterError("adb not found; pass --adb-path or install Android platform-tools")
+def find_adb_path(value: str, emulator: str = "", ld_dir: str = "", bs_dir: str = "") -> Path:
+    try:
+        return emulator_support.find_adb_path(
+            value,
+            emulator=emulator,
+            ld_dir=ld_dir,
+            bs_dir=bs_dir,
+        )
+    except emulator_support.EmulatorSupportError as exc:
+        raise RegisterError(str(exc)) from exc
 
 
 def adb_without_device(adb_path: Path, logger: logging.Logger) -> Adb:
@@ -2379,11 +2392,19 @@ def prepare_emulator_for_registration(args: argparse.Namespace, logger: logging.
         raise RegisterError(f"cannot import gopay_prepare_emulator.py: {exc}") from exc
 
     prep_args = argparse.Namespace(
+        emulator=args.emulator,
         ld_dir=args.ld_dir,
+        bs_dir=args.bs_dir,
+        adb_path=args.adb_path,
+        device=args.device,
+        connect_ports=args.connect_ports,
+        no_launch=args.no_launch_emulator,
         name=args.prepare_name,
         index=args.prepare_index,
         create=args.prepare_create,
         unique_name=args.prepare_unique_name,
+        bs_image=args.bs_image,
+        bs_clone_from=args.bs_clone_from,
         width=args.prepare_width,
         height=args.prepare_height,
         dpi=args.prepare_dpi,
@@ -2396,7 +2417,8 @@ def prepare_emulator_for_registration(args: argparse.Namespace, logger: logging.
     )
     assert_prepare_target_not_protected(args)
     logger.info(
-        "Preparing LDPlayer before registration name=%s index=%s",
+        "Preparing %s before registration name=%s index=%s",
+        prep_args.emulator,
         prep_args.name or "<auto>",
         prep_args.index or "<none>",
     )
@@ -2428,47 +2450,18 @@ def connect_device(
     requested: str,
     logger: logging.Logger,
     protected_devices: Optional[set[str]] = None,
+    ports: Optional[Iterable[int]] = None,
 ) -> str:
-    protected_devices = protected_devices or set()
-    base = adb_without_device(adb_path, logger)
-    if requested:
-        logger.info("Using requested ADB device %s", requested)
-        if is_protected_device(requested, protected_devices):
-            raise RegisterError(
-                f"refusing to use protected ADB device {requested}; choose another emulator/device"
-            )
-        if ":" in requested:
-            base.raw(["connect", requested], timeout=10)
-            time.sleep(0.8)
-        check = Adb(adb_path, requested, logger).raw(["get-state"], timeout=15)
-        if check.returncode != 0 or "device" not in (check.stdout or ""):
-            raise RegisterError(
-                f"requested ADB device is not ready: {requested} :: "
-                f"{(check.stderr or check.stdout or '').strip()}"
-            )
-        return requested
-
-    out = base.check(["devices"], timeout=15)
-    devices = filter_protected_devices(parse_adb_devices(out), protected_devices, logger)
-    if devices:
-        logger.info("Using connected ADB device %s", devices[0])
-        return devices[0]
-
-    for port in CONNECT_PORTS:
-        target = f"127.0.0.1:{port}"
-        logger.info("Trying adb connect %s", target)
-        base.raw(["connect", target], timeout=10)
-        time.sleep(0.8)
-        out = base.check(["devices"], timeout=15)
-        devices = filter_protected_devices(parse_adb_devices(out), protected_devices, logger)
-        if devices:
-            logger.info("Connected ADB device %s", devices[0])
-            return devices[0]
-
-    raise RegisterError(
-        "No ADB device connected. Open LDPlayer, enable ADB debugging, then retry. "
-        f"Tried ports: {', '.join(str(p) for p in CONNECT_PORTS)}"
-    )
+    try:
+        return emulator_support.connect_adb_device(
+            adb_path,
+            requested,
+            ports=ports or CONNECT_PORTS,
+            logger=logger,
+            protected_devices=protected_devices or set(),
+        )
+    except emulator_support.EmulatorSupportError as exc:
+        raise RegisterError(str(exc)) from exc
 
 
 def choose_gopay_package(adb: Adb, requested: str, logger: logging.Logger) -> str:
@@ -2593,6 +2586,7 @@ def build_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--test-claim-account", action="store_true", help="Test claiming a ChatGPT account from SQLite and exit")
     parser.add_argument("--claim-test-write-real-db", action="store_true", help="For --test-claim-account, write to the real DB instead of a copy")
     parser.add_argument("--test-post-gift-subscribe", action="store_true", help="Only test claiming an account and POST /subscribe")
+    parser.add_argument("--emulator", default="", choices=("", "ldplayer", "bluestacks", "adb"), help="Emulator adapter for preparation/ADB defaults")
     parser.add_argument("--adb-path", default="", help=rf"ADB path; default {DEFAULT_ADB}")
     parser.add_argument("--device", default="", help="ADB device serial; optional")
     parser.add_argument("--package", default="", help="GoPay/Gojek Android package; optional")
@@ -2607,6 +2601,11 @@ def build_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--protected-emulator-index", action="append", default=[], help="LDPlayer instance index that registration must never use")
     parser.add_argument("--protected-device", action="append", default=[], help="ADB device serial that registration must never use")
     parser.add_argument("--ld-dir", default="", help=rf"LDPlayer directory; default {DEFAULT_LD_DIR}")
+    parser.add_argument("--bs-dir", default="", help=rf"BlueStacks directory; default {DEFAULT_BS_DIR}")
+    parser.add_argument("--bs-image", default="", help="BlueStacks image for fresh instance creation")
+    parser.add_argument("--bs-clone-from", default="", help="Clone this BlueStacks instance instead of creating a fresh one")
+    parser.add_argument("--connect-port", action="append", type=int, default=[], help="ADB localhost port to try")
+    parser.add_argument("--no-launch-emulator", action="store_true", help="Do not launch BlueStacks during preparation")
     parser.add_argument("--mt-apk", default="", help=rf"MT Manager APK; default {DEFAULT_MT_APK}")
     parser.add_argument("--gopay-apks", default="", help=rf"GoPay APKS; default {DEFAULT_GOPAY_APKS}")
     parser.add_argument("--prepare-width", type=int, default=1080)
@@ -2692,6 +2691,9 @@ def enrich_args(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
     account_claim_cfg = (gopay_cfg.get("account_claim") or {})
     prepare_cfg = (gopay_cfg.get("prepare_emulator") or {})
     protected_cfg = protected_emulators_from_config(gopay_cfg)
+    args.emulator = emulator_support.normalize_emulator(
+        args.emulator or str(prepare_cfg.get("emulator") or prepare_cfg.get("type") or "ldplayer")
+    )
     args.protected_names = list(dict.fromkeys(
         config_string_list(args.protected_emulator_name) + protected_cfg["names"]
     ))
@@ -2713,6 +2715,28 @@ def enrich_args(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
     args.ld_dir = (
         args.ld_dir or str(prepare_cfg.get("ld_dir") or DEFAULT_LD_DIR)
     ).strip()
+    args.bs_dir = (
+        args.bs_dir or str(prepare_cfg.get("bs_dir") or prepare_cfg.get("bluestacks_dir") or DEFAULT_BS_DIR)
+    ).strip()
+    args.bs_image = (
+        args.bs_image or str(prepare_cfg.get("bs_image") or prepare_cfg.get("image") or emulator_support.DEFAULT_BLUESTACKS_IMAGE)
+    ).strip()
+    args.bs_clone_from = (
+        args.bs_clone_from or str(prepare_cfg.get("bs_clone_from") or prepare_cfg.get("clone_from") or "")
+    ).strip()
+    args.adb_path = (
+        args.adb_path or str(prepare_cfg.get("adb_path") or "")
+    ).strip()
+    args.device = (
+        args.device or str(prepare_cfg.get("device") or prepare_cfg.get("adb_device") or "")
+    ).strip()
+    args.connect_ports = (
+        args.connect_port
+        or emulator_support.parse_ports(prepare_cfg.get("connect_ports") or prepare_cfg.get("connect_port"))
+    )
+    args.no_launch_emulator = bool(
+        args.no_launch_emulator or prepare_cfg.get("no_launch") or prepare_cfg.get("no_launch_emulator")
+    )
     args.mt_apk = (
         args.mt_apk or str(prepare_cfg.get("mt_apk") or DEFAULT_MT_APK)
     ).strip()
@@ -2779,7 +2803,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         cfg = load_config(Path(args.config))
         args = enrich_args(args, cfg)
-        adb_path = find_adb_path(args.adb_path)
+        adb_path = find_adb_path(args.adb_path, args.emulator, args.ld_dir, args.bs_dir)
         log.info("Using adb: %s", adb_path)
         log.info("Phone=%s name=%s", redact_phone(args.full_phone), args.name)
         prepared_device = ""
@@ -2818,7 +2842,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.device = prepared_device
             if not args.get_rp_link:
                 raise RegisterError("get_rp_link is empty; set config.json gopay.get_rp_link or pass --get-rp-link")
-            device = connect_device(adb_path, args.device, log, protected_device_serials(args))
+            device = connect_device(adb_path, args.device, log, protected_device_serials(args), args.connect_ports)
             adb = Adb(adb_path, device, log)
             log.info("Opening get_rp_link in emulator browser")
             adb.open_url(args.get_rp_link)
@@ -2851,7 +2875,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if should_prepare_emulator(args):
                     prepared_device = prepare_emulator_for_registration(args, log)
                     args.device = prepared_device
-                device = connect_device(adb_path, args.device, log, protected_device_serials(args))
+                device = connect_device(adb_path, args.device, log, protected_device_serials(args), args.connect_ports)
                 adb = Adb(adb_path, device, log)
                 log.info("Opening get_rp_link in emulator browser")
                 adb.open_url(args.get_rp_link)
@@ -2892,16 +2916,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.info("OTP test succeeded: %s", code)
             return 0
 
-        maybe_buy_herosms_number(args, sms, log)
-        if not args.full_phone:
+        if not args.dry_run:
+            maybe_buy_herosms_number(args, sms, log)
+        if not args.full_phone and not args.dry_run:
             raise RegisterError("phone_number is required unless --auto-buy-number succeeds")
-        log.info("Registration phone=%s activation=%s", redact_phone(args.full_phone), args.sms_activation_id)
+        if args.full_phone:
+            log.info("Registration phone=%s activation=%s", redact_phone(args.full_phone), args.sms_activation_id)
+        else:
+            log.info("Dry-run without registration phone")
 
         if should_prepare_emulator(args):
             prepared_device = prepare_emulator_for_registration(args, log)
             args.device = prepared_device
 
-        device = connect_device(adb_path, args.device, log, protected_device_serials(args))
+        device = connect_device(adb_path, args.device, log, protected_device_serials(args), args.connect_ports)
         adb = Adb(adb_path, device, log)
 
         if args.input_test:

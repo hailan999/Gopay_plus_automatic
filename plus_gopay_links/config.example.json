@@ -17,7 +17,9 @@
     },
     "main_transfer": {
       "enabled": true,
+      "emulator": "ldplayer",
       "adb_path": "E:\\leidian\\LDPlayer9\\adb.exe",
+      "bs_dir": "C:\\Program Files\\BlueStacks_nxt_cn",
       "device": "",
       "package": "com.gojek.gopay",
       "pin": "211314",
@@ -37,11 +39,14 @@
     "language": "id-ID",
     "accept_language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     "timezone": "Asia/Jakarta",
-    "tz_offset": -420
+    "tz_offset": -420,
+    "register_stripe_m6": true,
+    "stripe_m6_timeout_s": 10
   },
   "billing": {
     "country": "ID",
     "postal_code": "34151"
   },
-  "proxy": ""
+  "proxy": "",
+  "payment_proxy": ""
 }

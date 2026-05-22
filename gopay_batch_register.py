@@ -17,14 +17,16 @@ from datetime import datetime
 from pathlib import Path
 
 import clash_verge_rotator
+import emulator_support
 import gopay_prepare_emulator as prep
 
 
 ROOT = Path(__file__).resolve().parent
 BATCH_LOG_DIR = ROOT / "logs" / "batch_register"
-DEFAULT_LD_DIR = Path(r"E:\leidian\LDPlayer9")
+DEFAULT_LD_DIR = emulator_support.DEFAULT_LD_DIR
+DEFAULT_BS_DIR = emulator_support.DEFAULT_BLUESTACKS_DIR
 DEFAULT_MT_APK = Path(r"C:\Users\Administrator\Downloads\MT2.26.4.apk")
-DEFAULT_GOPAY_APKS = Path(r"C:\Users\Administrator\Downloads\GoPay_2.7.0.apks")
+DEFAULT_GOPAY_APKS = Path(r"C:\Users\Administrator\Downloads\GoPay_2.8.0.apks")
 
 
 prepare_lock = threading.Lock()
@@ -194,6 +196,9 @@ def terminate_active_register_processes(logger: logging.Logger) -> None:
 
 
 def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.Namespace) -> None:
+    if getattr(args, "emulator", "ldplayer") != "ldplayer":
+        logger.info("Skipping emulator cleanup for %s; reuse/stop it manually if needed", args.emulator)
+        return
     if not index:
         return
     if is_protected_index(args, index):
@@ -213,6 +218,8 @@ def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.
 
 
 def recover_prepare_index(ld: Path, prep_args: argparse.Namespace | None, logger: WorkerLogger) -> str:
+    if ld is None:
+        return ""
     if prep_args is None:
         return ""
     name = str(getattr(prep_args, "name", "") or "").strip()
@@ -279,8 +286,16 @@ def confirm_keep_instance(args: argparse.Namespace, index: str, success: bool, l
 def build_prepare_args(args: argparse.Namespace, worker_id: int, run_no: int) -> argparse.Namespace:
     suffix = f"w{worker_id:02d}-r{run_no:05d}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(100000, 999999)}"
     return argparse.Namespace(
+        emulator=args.emulator,
         ld_dir=args.ld_dir,
-        name=f"{args.instance_prefix}-{suffix}",
+        bs_dir=args.bs_dir,
+        bs_image=args.bs_image,
+        bs_clone_from=args.bs_clone_from,
+        adb_path=args.adb_path,
+        device=(args.devices[(worker_id - 1) % len(args.devices)] if args.devices else ""),
+        connect_ports=args.connect_ports,
+        no_launch=args.no_launch_emulator,
+        name=(f"{args.instance_prefix}-{suffix}" if args.emulator == "ldplayer" else ""),
         index="",
         create=True,
         unique_name=True,
@@ -300,8 +315,14 @@ def build_prepare_command(prep_args: argparse.Namespace) -> list[str]:
     cmd = [
         sys.executable,
         str(ROOT / "gopay_prepare_emulator.py"),
+        "--emulator",
+        str(prep_args.emulator),
         "--ld-dir",
         str(prep_args.ld_dir),
+        "--bs-dir",
+        str(prep_args.bs_dir),
+        "--bs-image",
+        str(prep_args.bs_image),
         "--name",
         str(prep_args.name),
         "--width",
@@ -318,6 +339,16 @@ def build_prepare_command(prep_args: argparse.Namespace) -> list[str]:
         str(prep_args.boot_timeout),
         "--print-device",
     ]
+    if prep_args.adb_path:
+        cmd += ["--adb-path", str(prep_args.adb_path)]
+    if prep_args.bs_clone_from:
+        cmd += ["--bs-clone-from", str(prep_args.bs_clone_from)]
+    if prep_args.device:
+        cmd += ["--device", str(prep_args.device)]
+    for port in getattr(prep_args, "connect_ports", []) or []:
+        cmd += ["--connect-port", str(port)]
+    if getattr(prep_args, "no_launch", False):
+        cmd.append("--no-launch")
     if prep_args.index:
         cmd += ["--index", str(prep_args.index)]
     if prep_args.create:
@@ -404,12 +435,20 @@ def build_register_command(args: argparse.Namespace, device: str, run_dir: Path)
         str(ROOT / "gopay_register_adb.py"),
         "--config",
         args.config,
+        "--emulator",
+        args.emulator,
         "--skip-prepare-emulator",
         "--device",
         device,
+        "--bs-dir",
+        str(args.bs_dir),
         "--step-dir",
         str(run_dir / "steps"),
     ]
+    if args.adb_path:
+        cmd += ["--adb-path", str(args.adb_path)]
+    for port in getattr(args, "connect_ports", []) or []:
+        cmd += ["--connect-port", str(port)]
     if args.register_verbose:
         cmd.append("--verbose")
     for extra in args.register_arg:
@@ -463,7 +502,7 @@ def run_register(cmd: list[str], log_path: Path, logger: WorkerLogger, timeout: 
 
 
 def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.Logger) -> None:
-    ld = prep.ldconsole(Path(args.ld_dir))
+    ld = prep.ldconsole(Path(args.ld_dir)) if args.emulator == "ldplayer" else None
     stop_file = Path(args.stop_file)
     run_no = 0
     while True:
@@ -538,7 +577,15 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--prepare-timeout", type=int, default=420, help="Per-emulator prepare subprocess timeout seconds; 0 disables")
     parser.add_argument("--register-timeout", type=int, default=1800, help="Per-register subprocess timeout seconds; 0 disables")
     parser.add_argument("--config", default=str(ROOT / "config.json"))
+    parser.add_argument("--emulator", default="", choices=("", "ldplayer", "bluestacks", "adb"), help="Emulator adapter")
     parser.add_argument("--ld-dir", default=str(DEFAULT_LD_DIR))
+    parser.add_argument("--bs-dir", default=str(DEFAULT_BS_DIR))
+    parser.add_argument("--bs-image", default=emulator_support.DEFAULT_BLUESTACKS_IMAGE)
+    parser.add_argument("--bs-clone-from", default="", help="Clone this BlueStacks instance instead of creating a fresh one")
+    parser.add_argument("--adb-path", default="", help="ADB path; BlueStacks defaults to HD-Adb.exe")
+    parser.add_argument("--device", action="append", default=[], help="ADB device/host:port to assign to workers")
+    parser.add_argument("--connect-port", action="append", type=int, default=[], help="ADB localhost port to try")
+    parser.add_argument("--no-launch-emulator", action="store_true", help="Do not launch BlueStacks during preparation")
     parser.add_argument("--mt-apk", default=str(DEFAULT_MT_APK))
     parser.add_argument("--gopay-apks", default=str(DEFAULT_GOPAY_APKS))
     parser.add_argument("--instance-prefix", default="gopay-auto")
@@ -560,6 +607,25 @@ def build_args() -> argparse.Namespace:
         parser.error("--workers must be >= 1")
     cfg = load_config(Path(args.config))
     args.loaded_config = cfg
+    prepare_cfg = ((cfg.get("gopay") or {}).get("prepare_emulator") or {})
+    args.emulator = emulator_support.normalize_emulator(
+        args.emulator or str(prepare_cfg.get("emulator") or prepare_cfg.get("type") or "ldplayer")
+    )
+    args.bs_dir = str(args.bs_dir or prepare_cfg.get("bs_dir") or prepare_cfg.get("bluestacks_dir") or DEFAULT_BS_DIR)
+    args.bs_image = str(args.bs_image or prepare_cfg.get("bs_image") or prepare_cfg.get("image") or emulator_support.DEFAULT_BLUESTACKS_IMAGE)
+    args.bs_clone_from = str(args.bs_clone_from or prepare_cfg.get("bs_clone_from") or prepare_cfg.get("clone_from") or "")
+    args.adb_path = str(args.adb_path or prepare_cfg.get("adb_path") or "")
+    args.devices = config_string_list(args.device) or config_string_list(
+        prepare_cfg.get("devices") or prepare_cfg.get("device") or prepare_cfg.get("adb_device")
+    )
+    args.connect_ports = args.connect_port or emulator_support.parse_ports(
+        prepare_cfg.get("connect_ports") or prepare_cfg.get("connect_port")
+    )
+    args.no_launch_emulator = bool(
+        args.no_launch_emulator or prepare_cfg.get("no_launch") or prepare_cfg.get("no_launch_emulator")
+    )
+    if args.emulator != "ldplayer" and args.workers > 1 and len(args.devices) < args.workers:
+        parser.error("non-LDPlayer batch mode needs one --device per worker, or use --workers 1")
     protected_cfg = protected_emulators_from_config(cfg)
     args.protected_indexes = list(dict.fromkeys(
         config_string_list(args.protected_emulator_index) + protected_cfg["indexes"]

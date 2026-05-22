@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-DEFAULT_ADB = Path(r"E:\leidian\LDPlayer9\adb.exe")
 DEFAULT_PACKAGE = "com.gojek.gopay"
 GOPAY_PACKAGE_CANDIDATES = ("com.gojek.gopay", "com.gojek.app", "com.go-jek.ios")
 UI_DUMP_DEVICE_PATH = "/sdcard/window.xml"
@@ -27,7 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import clash_verge_rotator
+import emulator_support
 
+DEFAULT_ADB = emulator_support.DEFAULT_LD_DIR / "adb.exe"
 DEFAULT_LOCK_DIR = ROOT / "logs" / "main_transfer_locks"
 
 
@@ -232,12 +233,17 @@ class Adb:
         )
 
     def check(self, args: list[str], timeout: int = 20) -> str:
-        proc = self.raw(args, timeout=timeout)
-        if proc.returncode != 0:
-            raise MainTransferError(
-                f"adb command failed: {' '.join(args)} :: {(proc.stderr or proc.stdout or '').strip()}"
-            )
-        return proc.stdout or ""
+        last = ""
+        for attempt in range(3):
+            proc = self.raw(args, timeout=timeout)
+            if proc.returncode == 0:
+                return proc.stdout or ""
+            last = emulator_support.adb_error_text(proc)
+            if attempt >= 2 or not emulator_support.is_transient_adb_error(last):
+                break
+            self.log.warning("[main-transfer] ADB transient failure (%s); recovering and retrying", last)
+            emulator_support.recover_adb(Path(self.adb_path), self.device, self.log)
+        raise MainTransferError(f"adb command failed: {' '.join(args)} :: {last}")
 
     def shell(self, command: str, timeout: int = 20) -> str:
         return self.check(["shell", command], timeout=timeout)
@@ -269,11 +275,15 @@ class Adb:
             time.sleep(0.01)
 
     def wm_size(self) -> tuple[int, int]:
-        out = self.shell("wm size", timeout=8)
+        try:
+            out = self.shell("wm size", timeout=8)
+        except MainTransferError as exc:
+            self.log.warning("[main-transfer] wm size failed, using 1080x1920 fallback: %s", exc)
+            return 1080, 1920
         match = re.search(r"Physical size:\s*(\d+)x(\d+)", out)
         if match:
             return int(match.group(1)), int(match.group(2))
-        return 560, 1000
+        return 1080, 1920
 
     def dump_ui(self) -> UiState:
         width, height = self.wm_size()
@@ -885,9 +895,20 @@ def run_main_transfer(
     if not device:
         raise MainTransferError("main_transfer needs device or gopay.protected_emulators.devices/indexes")
 
-    adb_path = Path(str(transfer_cfg.get("adb_path") or DEFAULT_ADB))
-    if not adb_path.exists():
-        raise MainTransferError(f"adb not found: {adb_path}")
+    emulator = emulator_support.normalize_emulator(str(transfer_cfg.get("emulator") or transfer_cfg.get("type") or "ldplayer"))
+    try:
+        adb_path = emulator_support.find_adb_path(
+            str(transfer_cfg.get("adb_path") or ""),
+            emulator=emulator,
+            bs_dir=str(transfer_cfg.get("bs_dir") or transfer_cfg.get("bluestacks_dir") or ""),
+        )
+    except emulator_support.EmulatorSupportError as exc:
+        raise MainTransferError(str(exc)) from exc
+    if ":" in device:
+        try:
+            emulator_support.connect_adb_device(adb_path, device, logger=logger)
+        except emulator_support.EmulatorSupportError as exc:
+            raise MainTransferError(str(exc)) from exc
 
     min_amount = int(transfer_cfg.get("amount_min") or 150)
     max_amount = int(transfer_cfg.get("amount_max") or 300)
