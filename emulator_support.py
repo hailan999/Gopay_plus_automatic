@@ -13,7 +13,7 @@ from typing import Iterable, Protocol
 
 DEFAULT_LD_DIR = Path(r"E:\leidian\LDPlayer9")
 DEFAULT_BLUESTACKS_DIR = Path(r"C:\Program Files\BlueStacks_nxt_cn")
-DEFAULT_CONNECT_PORTS = (5555, 5557, 5559, 5561, 7555)
+DEFAULT_CONNECT_PORTS = (5555, 5557, 5559, 5561, 5575, 5585, 5595, 5605, 5615, 5625, 7555)
 DEFAULT_BLUESTACKS_IMAGE = "Pie64"
 
 
@@ -26,7 +26,7 @@ class BlueStacksInstance:
 
     @property
     def connect_serial(self) -> str:
-        port = self.status_adb_port or self.adb_port
+        port = self.adb_port or self.status_adb_port
         return f"127.0.0.1:{port}" if port else ""
 
 
@@ -181,13 +181,26 @@ def is_transient_adb_error(text: str) -> bool:
 def recover_adb(adb_path: Path, device: str = "", logger: LoggerLike | None = None) -> None:
     if logger:
         logger.info("Recovering ADB connection%s", f" for {device}" if device else "")
-    run_adb(adb_path, ["kill-server"], timeout=10)
+    try:
+        run_adb(adb_path, ["kill-server"], timeout=10)
+    except subprocess.TimeoutExpired:
+        if logger:
+            logger.warning("adb kill-server timed out during recovery")
     time.sleep(1)
-    run_adb(adb_path, ["start-server"], timeout=15)
+    try:
+        run_adb(adb_path, ["start-server"], timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        raise EmulatorSupportError("adb start-server timed out during recovery") from exc
     if ":" in str(device or ""):
-        run_adb(adb_path, ["connect", device], timeout=10)
+        try:
+            run_adb(adb_path, ["connect", device], timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            raise EmulatorSupportError(f"adb connect timed out during recovery for {device}") from exc
     if device:
-        run_adb(adb_path, ["wait-for-device"], device=device, timeout=20)
+        try:
+            run_adb(adb_path, ["wait-for-device"], device=device, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            raise EmulatorSupportError(f"adb wait-for-device timed out during recovery for {device}") from exc
     time.sleep(0.5)
 
 
@@ -234,9 +247,15 @@ def connect_adb_device(
                 f"refusing to use protected ADB device {requested}; choose another emulator/device"
             )
         if ":" in requested:
-            run_adb(adb_path, ["connect", requested], timeout=10)
+            try:
+                run_adb(adb_path, ["connect", requested], timeout=10)
+            except subprocess.TimeoutExpired as exc:
+                raise EmulatorSupportError(f"adb connect timed out for {requested}") from exc
             time.sleep(0.8)
-        check = run_adb(adb_path, ["get-state"], device=requested, timeout=15)
+        try:
+            check = run_adb(adb_path, ["get-state"], device=requested, timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            raise EmulatorSupportError(f"adb get-state timed out for {requested}") from exc
         if check.returncode != 0 or "device" not in (check.stdout or ""):
             raise EmulatorSupportError(
                 f"requested ADB device is not ready: {requested} :: "
@@ -257,7 +276,12 @@ def connect_adb_device(
         tried.append(target)
         if logger:
             logger.info("Trying adb connect %s", target)
-        run_adb(adb_path, ["connect", target], timeout=10)
+        try:
+            run_adb(adb_path, ["connect", target], timeout=10)
+        except subprocess.TimeoutExpired:
+            if logger:
+                logger.info("adb connect timed out for %s", target)
+            continue
         time.sleep(0.8)
         out = check_adb(adb_path, ["devices"], timeout=15)
         devices = [device for device in parse_adb_devices(out) if device.strip().lower() not in protected_devices]
@@ -448,6 +472,7 @@ def wait_for_bluestacks_instance_count(
     before_ports = before_ports or set()
     deadline = time.time() + timeout
     last_instances: list[BlueStacksInstance] = []
+    pending_created: BlueStacksInstance | None = None
     while time.time() < deadline:
         try:
             last_instances = bluestacks_instances(bs_dir)
@@ -458,11 +483,22 @@ def wait_for_bluestacks_instance_count(
             for item in last_instances
             if item.name not in before_names
             and item.connect_serial
-            and ((item.status_adb_port or item.adb_port) not in before_ports)
+            and ((item.adb_port or item.status_adb_port) not in before_ports)
         ]
         if created:
             return sorted(created, key=lambda item: item.name)[-1]
+        new_instances = [item for item in last_instances if item.name not in before_names]
+        if new_instances:
+            pending_created = sorted(new_instances, key=lambda item: item.name)[-1]
+            pending_port = pending_created.adb_port or pending_created.status_adb_port
+            if pending_created.connect_serial and pending_port not in before_ports:
+                return pending_created
         time.sleep(3)
+    if pending_created:
+        raise EmulatorSupportError(
+            "BlueStacks instance was created but no ADB port appeared within "
+            f"{timeout}s: {pending_created.name}"
+        )
     known = ", ".join(item.name for item in last_instances) or "<none>"
     raise EmulatorSupportError(
         f"BlueStacks instance was not created within {timeout}s; known instances: {known}"

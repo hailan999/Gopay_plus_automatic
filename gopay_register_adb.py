@@ -1011,6 +1011,11 @@ class Adb:
             return 1080, 1920
         return int(match.group(1)), int(match.group(2))
 
+    def set_display(self, width: int, height: int, dpi: int) -> None:
+        self.log.info("Set display resolution=%sx%s dpi=%s", width, height, dpi)
+        self.shell(f"wm size {int(width)}x{int(height)}", timeout=15)
+        self.shell(f"wm density {int(dpi)}", timeout=15)
+
     def screenshot(self, path: Path) -> None:
         proc = self.raw(["exec-out", "screencap", "-p"], timeout=20, binary=True)
         if proc.returncode != 0:
@@ -1020,13 +1025,32 @@ class Adb:
 
     def dump_ui(self) -> UiState:
         width, height = self.wm_size()
-        self.shell(f"uiautomator dump {UI_DUMP_DEVICE_PATH} >/dev/null 2>&1", timeout=15)
-        xml = self.shell(f"cat {UI_DUMP_DEVICE_PATH}", timeout=15)
+        paths = (UI_DUMP_DEVICE_PATH, "/data/local/tmp/window.xml")
+        last_error = ""
+        xml = ""
+        root = None
+        for attempt in range(1, 6):
+            for path in paths:
+                try:
+                    self.raw(["shell", "rm", "-f", path], timeout=5)
+                    proc = self.raw(["shell", "uiautomator", "dump", "--compressed", path], timeout=20)
+                    if proc.returncode != 0:
+                        proc = self.raw(["shell", "uiautomator", "dump", path], timeout=20)
+                    if proc.returncode != 0:
+                        last_error = emulator_support.adb_error_text(proc)
+                        continue
+                    xml = self.check(["shell", "cat", path], timeout=15)
+                    root = ET.fromstring(xml)
+                    break
+                except (RegisterError, ET.ParseError, subprocess.TimeoutExpired) as exc:
+                    last_error = str(exc)
+            if root is not None:
+                break
+            self.log.warning("uiautomator XML not ready attempt %s/5: %s", attempt, last_error)
+            time.sleep(1.5)
+        if root is None:
+            raise RegisterError(f"uiautomator XML not ready after retries: {last_error}")
         nodes: list[UiNode] = []
-        try:
-            root = ET.fromstring(xml)
-        except ET.ParseError as exc:
-            raise RegisterError(f"uiautomator XML parse failed: {exc}") from exc
         for elem in root.iter("node"):
             text = elem.attrib.get("text", "") or ""
             desc = elem.attrib.get("content-desc", "") or ""
@@ -2931,6 +2955,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         device = connect_device(adb_path, args.device, log, protected_device_serials(args), args.connect_ports)
         adb = Adb(adb_path, device, log)
+        adb.set_display(args.prepare_width, args.prepare_height, args.prepare_dpi)
 
         if args.input_test:
             log.info("Typing input-test value into the current focused field")

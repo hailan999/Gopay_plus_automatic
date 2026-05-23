@@ -256,6 +256,19 @@ def wait_for_adb_android(adb_path: Path, device: str, logger: logging.Logger, ti
     raise PrepareError(f"Android did not boot in {timeout}s: {last}")
 
 
+def set_adb_display(
+    adb_path: Path,
+    device: str,
+    width: int,
+    height: int,
+    dpi: int,
+    logger: logging.Logger,
+) -> None:
+    logger.info("Set ADB display device=%s resolution=%sx%s dpi=%s", device, width, height, dpi)
+    adb_check(adb_path, device, ["shell", f"wm size {int(width)}x{int(height)}"], logger, timeout=20)
+    adb_check(adb_path, device, ["shell", f"wm density {int(dpi)}"], logger, timeout=20)
+
+
 def install_gopay_splits_adb(
     adb_path: Path,
     device: str,
@@ -314,6 +327,22 @@ def launch_bluestacks(args: argparse.Namespace, logger: logging.Logger, instance
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def enable_bluestacks_adb(args: argparse.Namespace, logger: logging.Logger, instance_name: str = "") -> None:
+    try:
+        player = emulator_support.bluestacks_player(args.bs_dir)
+    except emulator_support.EmulatorSupportError as exc:
+        raise PrepareError(str(exc)) from exc
+    name = str(instance_name or args.name or "").strip()
+    if not name:
+        return
+    logger.info("Enabling BlueStacks ADB access instance=%s", name)
+    subprocess.Popen(
+        [str(player), "--instance", name, "--cmd", "enableAdbAccess"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def ensure_bluestacks_instance(args: argparse.Namespace, logger: logging.Logger) -> emulator_support.BlueStacksInstance:
     requested = bool(str(args.name or "").strip() or str(args.index or "").strip())
     instance = None if (args.create and not requested) else emulator_support.find_bluestacks_instance(args.name, bs_dir=args.bs_dir, index=args.index)
@@ -329,11 +358,12 @@ def ensure_bluestacks_instance(args: argparse.Namespace, logger: logging.Logger)
         wanted = args.name or args.index or "<first>"
         raise PrepareError(f"BlueStacks instance not found: {wanted}; pass --create to create one")
     try:
+        create_timeout = max(int(args.boot_timeout or 0), 420)
         created = emulator_support.create_bluestacks_instance(
             bs_dir=args.bs_dir,
             image_name=getattr(args, "bs_image", "") or emulator_support.DEFAULT_BLUESTACKS_IMAGE,
             clone_from=getattr(args, "bs_clone_from", "") or "",
-            timeout=args.boot_timeout,
+            timeout=create_timeout,
             logger=logger,
         )
     except emulator_support.EmulatorSupportError as exc:
@@ -434,23 +464,31 @@ def prepare_adb_emulator(args: argparse.Namespace, logger: logging.Logger) -> di
             if not args.no_launch:
                 launch_bluestacks(args, logger, bs_instance.name)
                 time.sleep(1)
+                enable_bluestacks_adb(args, logger, bs_instance.name)
+                time.sleep(2)
+        wait_timeout = max(int(args.boot_timeout or 0), 420) if emulator == "bluestacks" else args.boot_timeout
         device = emulator_support.connect_adb_device_wait(
             adb_path,
             device_hint,
             ports=args.connect_ports,
-            timeout=args.boot_timeout,
+            timeout=wait_timeout,
             logger=logger,
         )
     except emulator_support.EmulatorSupportError as exc:
         raise PrepareError(str(exc)) from exc
 
-    wait_for_adb_android(adb_path, device, logger, timeout=args.boot_timeout)
+    wait_timeout = max(int(args.boot_timeout or 0), 420) if emulator == "bluestacks" else args.boot_timeout
+    wait_for_adb_android(adb_path, device, logger, timeout=wait_timeout)
     logger.info("ADB emulator ready emulator=%s adb=%s device=%s", emulator, adb_path, device)
+    set_adb_display(adb_path, device, args.width, args.height, args.dpi, logger)
 
-    logger.info("Installing MT Manager via adb: %s", mt_apk)
-    out = adb_check(adb_path, device, ["install", "-r", str(mt_apk)], logger, timeout=240)
-    if "Success" not in out:
-        logger.warning("MT Manager install did not print Success: %s", out[:300])
+    if emulator == "bluestacks" and not args.open_mt:
+        logger.info("Skipping MT Manager install for BlueStacks; GoPay split APKs install directly via adb")
+    else:
+        logger.info("Installing MT Manager via adb: %s", mt_apk)
+        out = adb_check(adb_path, device, ["install", "-r", str(mt_apk)], logger, timeout=240)
+        if "Success" not in out:
+            logger.warning("MT Manager install did not print Success: %s", out[:300])
 
     logger.info("Pushing GoPay APKS to /sdcard/Pictures/")
     adb_check(adb_path, device, ["shell", "mkdir -p /sdcard/Pictures"], logger, timeout=30)
@@ -480,8 +518,9 @@ def prepare_adb_emulator(args: argparse.Namespace, logger: logging.Logger) -> di
             timeout=60,
         )
 
-    logger.info("Preparation done. emulator=%s device=%s", emulator, device)
-    return {"index": str(args.index or ""), "name": str(args.name or ""), "device": device, "package": package}
+    identity = bs_instance.name if bs_instance else str(args.index or "")
+    logger.info("Preparation done. emulator=%s instance=%s device=%s", emulator, identity or "<none>", device)
+    return {"index": str(identity or ""), "name": str(args.name or identity or ""), "device": device, "package": package}
 
 
 def prepare(args: argparse.Namespace, logger: logging.Logger) -> dict[str, str]:

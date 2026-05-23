@@ -32,7 +32,7 @@
       "bs_clone_from": "",
       "adb_path": "",
       "device": "",
-      "connect_ports": [5555, 5557, 5559, 5561, 7555],
+      "connect_ports": [5555, 5557, 5559, 5561, 5575, 5585, 5595, 5605, 5615, 5625, 7555],
       "mt_apk": "C:\\Users\\Administrator\\Downloads\\MT2.26.4.apk",
       "gopay_apks": "C:\\Users\\Administrator\\Downloads\\GoPay_2.8.0.apks",
       "width": 1080,
