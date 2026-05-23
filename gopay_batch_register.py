@@ -78,6 +78,15 @@ def is_protected_index(args: argparse.Namespace, index: str) -> bool:
     return str(index or "").strip() in protected
 
 
+def is_protected_name(args: argparse.Namespace, name: str) -> bool:
+    protected = {
+        str(item).strip().lower()
+        for item in getattr(args, "protected_names", [])
+        if str(item).strip()
+    }
+    return str(name or "").strip().lower() in protected
+
+
 def start_clash_rotation_thread(cfg: dict, logger: logging.Logger) -> tuple[threading.Thread | None, threading.Event | None]:
     rotation_cfg = cfg.get("clash_verge_rotation") or {}
     if not isinstance(rotation_cfg, dict) or not rotation_cfg.get("enabled", False):
@@ -196,8 +205,12 @@ def terminate_active_register_processes(logger: logging.Logger) -> None:
 
 
 def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.Namespace) -> None:
-    if getattr(args, "emulator", "ldplayer") != "ldplayer":
-        logger.info("Skipping emulator cleanup for %s; reuse/stop it manually if needed", args.emulator)
+    emulator = getattr(args, "emulator", "ldplayer")
+    if emulator == "bluestacks":
+        cleanup_bluestacks_instance(index, logger, args)
+        return
+    if emulator != "ldplayer":
+        logger.info("Skipping emulator cleanup for %s instance=%s; reuse/stop it manually if needed", emulator, index)
         return
     if not index:
         return
@@ -215,6 +228,58 @@ def cleanup_instance(ld: Path, index: str, logger: WorkerLogger, args: argparse.
         prep.run_cmd([str(ld), "remove", "--index", str(index)], logger, timeout=120)
     except Exception as exc:
         logger.warning("LDPlayer remove failed index=%s: %s", index, exc)
+
+
+def cleanup_bluestacks_instance(instance_name: str, logger: WorkerLogger, args: argparse.Namespace) -> None:
+    name = str(instance_name or "").strip()
+    if not name:
+        return
+    if is_protected_name(args, name):
+        logger.error("Refusing to stop protected BlueStacks instance=%s", name)
+        return
+    identifiers = [name]
+    try:
+        instance = emulator_support.find_bluestacks_instance(name, bs_dir=args.bs_dir)
+        if instance and instance.display_name and instance.display_name not in identifiers:
+            identifiers.append(instance.display_name)
+    except Exception as exc:
+        logger.warning("Could not resolve BlueStacks display name for instance=%s: %s", name, exc)
+    commands: list[list[str]] = []
+    try:
+        manager = emulator_support.bluestacks_manager(args.bs_dir)
+        for ident in identifiers:
+            commands.extend(
+                [
+                    [str(manager), "--cmd", "stopInstance", "--instance", ident],
+                    [str(manager), "--cmd", "stopInstance", "--name", ident],
+                ]
+            )
+    except Exception as exc:
+        logger.warning("BlueStacks manager not found for stop instance=%s: %s", name, exc)
+    for ident in identifiers:
+        if ident != name:
+            commands.append(["taskkill", "/FI", f"WINDOWTITLE eq {ident}*", "/IM", "HD-Player.exe", "/F"])
+    errors: list[str] = []
+    stopped = False
+    for cmd in commands:
+        try:
+            logger.info("Stopping BlueStacks instance=%s via %s", name, Path(cmd[0]).name)
+            prep.run_cmd(cmd, logger, timeout=60)
+            stopped = True
+        except Exception as exc:
+            errors.append(str(exc))
+    if stopped:
+        time.sleep(2)
+        return
+    logger.warning("BlueStacks stop failed instance=%s: %s", name, " | ".join(errors[-3:]))
+
+
+def should_cleanup_instance(args: argparse.Namespace, success: bool) -> bool:
+    if not success and getattr(args, "keep_failed", False):
+        return False
+    if args.emulator == "bluestacks":
+        return True
+    return bool(success or not getattr(args, "keep_failed", False))
 
 
 def recover_prepare_index(ld: Path, prep_args: argparse.Namespace | None, logger: WorkerLogger) -> str:
@@ -267,24 +332,29 @@ def _read_keep_key(timeout_seconds: float) -> bool:
 def confirm_keep_instance(args: argparse.Namespace, index: str, success: bool, logger: WorkerLogger) -> bool:
     if not args.confirm_keep_window:
         return False
+    label = "LDPlayer index" if args.emulator == "ldplayer" else f"{args.emulator} instance"
     timeout = max(1.0, float(args.confirm_keep_timeout))
     with prompt_lock:
         logger.warning(
-            "LDPlayer index=%s finished success=%s. Press K within %.0fs to keep this emulator for debugging.",
+            "%s=%s finished success=%s. Press K within %.0fs to keep this emulator for debugging.",
+            label,
             index,
             success,
             timeout,
         )
         keep = _read_keep_key(timeout)
         if keep:
-            logger.warning("Keeping LDPlayer index=%s because user pressed K", index)
+            logger.warning("Keeping %s=%s because user pressed K", label, index)
             return True
-        logger.info("No keep confirmation for LDPlayer index=%s; continuing cleanup", index)
+        logger.info("No keep confirmation for %s=%s; continuing cleanup", label, index)
         return False
 
 
 def build_prepare_args(args: argparse.Namespace, worker_id: int, run_no: int) -> argparse.Namespace:
     suffix = f"w{worker_id:02d}-r{run_no:05d}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(100000, 999999)}"
+    name = ""
+    if args.emulator in {"ldplayer", "bluestacks"} and not args.devices:
+        name = f"{args.instance_prefix}-{suffix}"
     return argparse.Namespace(
         emulator=args.emulator,
         ld_dir=args.ld_dir,
@@ -295,7 +365,7 @@ def build_prepare_args(args: argparse.Namespace, worker_id: int, run_no: int) ->
         device=(args.devices[(worker_id - 1) % len(args.devices)] if args.devices else ""),
         connect_ports=args.connect_ports,
         no_launch=args.no_launch_emulator,
-        name=(f"{args.instance_prefix}-{suffix}" if args.emulator == "ldplayer" else ""),
+        name=name,
         index="",
         create=True,
         unique_name=True,
@@ -362,7 +432,23 @@ def build_prepare_command(prep_args: argparse.Namespace) -> list[str]:
     return cmd
 
 
-def run_prepare(prep_args: argparse.Namespace, logger: WorkerLogger, timeout: int) -> dict[str, str]:
+def worker_env(args: argparse.Namespace, worker_id: int, logger: WorkerLogger) -> dict[str, str] | None:
+    if args.emulator != "bluestacks" or int(getattr(args, "workers", 1) or 1) <= 1:
+        return None
+    base = int(getattr(args, "adb_server_port_base", 5037) or 5037)
+    port = base + worker_id
+    env = os.environ.copy()
+    env["ADB_SERVER_PORT"] = str(port)
+    logger.info("Using isolated ADB server port=%s for worker=%02d", port, worker_id)
+    return env
+
+
+def run_prepare(
+    prep_args: argparse.Namespace,
+    logger: WorkerLogger,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
     cmd = build_prepare_command(prep_args)
     logger.info("Starting prepare subprocess: %s", " ".join(cmd))
     prepared: dict[str, str] = {}
@@ -375,6 +461,7 @@ def run_prepare(prep_args: argparse.Namespace, logger: WorkerLogger, timeout: in
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         line_queue: queue.Queue[str] = queue.Queue()
 
@@ -456,7 +543,13 @@ def build_register_command(args: argparse.Namespace, device: str, run_dir: Path)
     return cmd
 
 
-def run_register(cmd: list[str], log_path: Path, logger: WorkerLogger, timeout: int) -> int:
+def run_register(
+    cmd: list[str],
+    log_path: Path,
+    logger: WorkerLogger,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> int:
     if stop_event.is_set():
         logger.warning("Stop requested before register subprocess start")
         return 130
@@ -470,6 +563,7 @@ def run_register(cmd: list[str], log_path: Path, logger: WorkerLogger, timeout: 
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         _register_proc(proc)
         try:
@@ -523,22 +617,25 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
         try:
             logger.info("Run started worker=%02d run=%05d", worker_id, run_no)
             prep_args = build_prepare_args(args, worker_id, run_no)
+            env = worker_env(args, worker_id, logger)
             if args.parallel_prepare:
-                result = run_prepare(prep_args, logger, args.prepare_timeout)
+                result = run_prepare(prep_args, logger, args.prepare_timeout, env)
             else:
+                logger.info("Waiting for prepare slot")
                 with prepare_lock:
-                    result = run_prepare(prep_args, logger, args.prepare_timeout)
+                    logger.info("Acquired prepare slot")
+                    result = run_prepare(prep_args, logger, args.prepare_timeout, env)
             index = str(result.get("index") or "")
             device = str(result.get("device") or "")
-            logger.info("Prepared index=%s device=%s", index, device)
-            if is_protected_index(args, index):
+            logger.info("Prepared instance=%s device=%s", index, device)
+            if args.emulator == "ldplayer" and is_protected_index(args, index):
                 logger.error("Prepared protected LDPlayer index=%s; refusing registration", index)
                 return
             if stop_requested(stop_file):
                 logger.warning("Stop requested after prepare; skipping registration")
                 return
             cmd = build_register_command(args, device, run_dir)
-            code = run_register(cmd, run_dir / "register.log", logger, args.register_timeout)
+            code = run_register(cmd, run_dir / "register.log", logger, args.register_timeout, env)
             success = code == 0
             logger.info("Register subprocess exited code=%s success=%s", code, success)
         except Exception as exc:
@@ -546,13 +643,13 @@ def worker_loop(worker_id: int, args: argparse.Namespace, base_logger: logging.L
             if not index:
                 index = recover_prepare_index(ld, prep_args, logger)
         finally:
-            if index and (success or not args.keep_failed):
+            if index and should_cleanup_instance(args, success):
                 if confirm_keep_instance(args, index, success, logger):
-                    logger.warning("Skipping cleanup for LDPlayer index=%s", index)
+                    logger.warning("Skipping cleanup for instance=%s", index)
                 else:
                     cleanup_instance(ld, index, logger, args)
             elif index:
-                logger.warning("Keeping failed LDPlayer index=%s for debugging", index)
+                logger.warning("Keeping failed instance=%s for debugging", index)
             if args.delay_between_runs > 0:
                 if stop_requested(stop_file):
                     logger.info("Stop requested; not sleeping before next run")
@@ -571,9 +668,10 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--stop-file", default=str(BATCH_LOG_DIR / "stop_batch.txt"))
     parser.add_argument("--honor-existing-stop-file", action="store_true", help="Do not clear an old stop file at startup")
     parser.add_argument("--keep-failed", action="store_true", help="Do not delete emulator for failed runs")
+    parser.add_argument("--close-failed", action="store_true", help="Close BlueStacks windows even when registration fails")
     parser.add_argument("--confirm-keep-window", action="store_true", help="After each run, wait briefly for K to keep the emulator before cleanup")
     parser.add_argument("--confirm-keep-timeout", type=float, default=5.0, help="Seconds to wait for --confirm-keep-window")
-    parser.add_argument("--parallel-prepare", action="store_true", help="Allow LDPlayer prepare steps to run concurrently")
+    parser.add_argument("--parallel-prepare", action="store_true", help="Allow emulator prepare steps to run concurrently")
     parser.add_argument("--prepare-timeout", type=int, default=420, help="Per-emulator prepare subprocess timeout seconds; 0 disables")
     parser.add_argument("--register-timeout", type=int, default=1800, help="Per-register subprocess timeout seconds; 0 disables")
     parser.add_argument("--config", default=str(ROOT / "config.json"))
@@ -585,6 +683,7 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--adb-path", default="", help="ADB path; BlueStacks defaults to HD-Adb.exe")
     parser.add_argument("--device", action="append", default=[], help="ADB device/host:port to assign to workers")
     parser.add_argument("--connect-port", action="append", type=int, default=[], help="ADB localhost port to try")
+    parser.add_argument("--adb-server-port-base", type=int, default=5037, help="Base ADB server port for isolated BlueStacks workers")
     parser.add_argument("--no-launch-emulator", action="store_true", help="Do not launch BlueStacks during preparation")
     parser.add_argument("--mt-apk", default=str(DEFAULT_MT_APK))
     parser.add_argument("--gopay-apks", default=str(DEFAULT_GOPAY_APKS))
@@ -624,8 +723,8 @@ def build_args() -> argparse.Namespace:
     args.no_launch_emulator = bool(
         args.no_launch_emulator or prepare_cfg.get("no_launch") or prepare_cfg.get("no_launch_emulator")
     )
-    if args.emulator != "ldplayer" and args.workers > 1 and len(args.devices) < args.workers:
-        parser.error("non-LDPlayer batch mode needs one --device per worker, or use --workers 1")
+    if args.emulator == "adb" and args.workers > 1 and len(args.devices) < args.workers:
+        parser.error("adb batch mode needs one --device per worker, or use --workers 1")
     protected_cfg = protected_emulators_from_config(cfg)
     args.protected_indexes = list(dict.fromkeys(
         config_string_list(args.protected_emulator_index) + protected_cfg["indexes"]

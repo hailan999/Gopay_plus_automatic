@@ -892,14 +892,33 @@ def post_subscribe_after_gift(
     )
 
     if not wait_response:
-        def _send_async() -> None:
-            try:
-                with urllib.request.urlopen(req, timeout=3):
-                    pass
-            except Exception as exc:
-                logger.warning("post-gift subscribe fire-and-forget send failed: %s", exc)
-
-        threading.Thread(target=_send_async, name="post-gift-subscribe", daemon=False).start()
+        payload = json.dumps(
+            {"url": url, "body": body, "headers": headers},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        code = (
+            "import json,sys,urllib.request;"
+            "p=json.loads(sys.argv[1]);"
+            "req=urllib.request.Request(p['url'],data=json.dumps(p['body']).encode('utf-8'),"
+            "method='POST',headers=p['headers']);"
+            "\ntry:\n"
+            "    urllib.request.urlopen(req, timeout=8).close()\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+        kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+        subprocess.Popen([sys.executable, "-c", code, payload], **kwargs)
         logger.info("post-gift subscribe request dispatched; not waiting for payment result")
         return
 
@@ -1047,6 +1066,11 @@ class Adb:
             if root is not None:
                 break
             self.log.warning("uiautomator XML not ready attempt %s/5: %s", attempt, last_error)
+            if emulator_support.is_transient_adb_error(last_error):
+                try:
+                    emulator_support.recover_adb(Path(self.adb_path), self.device, self.log)
+                except emulator_support.EmulatorSupportError as exc:
+                    last_error = str(exc)
             time.sleep(1.5)
         if root is None:
             raise RegisterError(f"uiautomator XML not ready after retries: {last_error}")
@@ -1715,6 +1739,7 @@ class GoPayRegisterFlow:
         self.adb.digits(code)
         if self.pin_entries > 0:
             self.pin_otp_submitted = True
+            self.pin_submit_started_at = 0.0
         time.sleep(2)
         return False
 
@@ -1990,8 +2015,6 @@ class GoPayRegisterFlow:
                 return True
 
         self.pin_submit_started_at = 0.0
-        self.pin_otp_submitted = False
-        self.pin_entries = 0
         self.log.info("PIN confirm recovery did not find completion; will navigate to Create PIN again")
         return True
 
@@ -2105,6 +2128,9 @@ class GoPayRegisterFlow:
         ) or state.contains_all(
             "25%",
             "1/4 actions completed",
+        ) or state.contains_all(
+            "Account & safety",
+            "Account protection",
         )
 
     def stop_existing_pin_account(self, state: UiState, detail: str) -> bool:

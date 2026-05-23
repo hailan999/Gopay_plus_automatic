@@ -181,6 +181,18 @@ def is_transient_adb_error(text: str) -> bool:
 def recover_adb(adb_path: Path, device: str = "", logger: LoggerLike | None = None) -> None:
     if logger:
         logger.info("Recovering ADB connection%s", f" for {device}" if device else "")
+    if ":" in str(device or ""):
+        try:
+            run_adb(adb_path, ["connect", device], timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            raise EmulatorSupportError(f"adb connect timed out during recovery for {device}") from exc
+        time.sleep(1)
+        try:
+            run_adb(adb_path, ["wait-for-device"], device=device, timeout=25)
+        except subprocess.TimeoutExpired as exc:
+            raise EmulatorSupportError(f"adb wait-for-device timed out during recovery for {device}") from exc
+        time.sleep(0.5)
+        return
     try:
         run_adb(adb_path, ["kill-server"], timeout=10)
     except subprocess.TimeoutExpired:
@@ -191,11 +203,6 @@ def recover_adb(adb_path: Path, device: str = "", logger: LoggerLike | None = No
         run_adb(adb_path, ["start-server"], timeout=15)
     except subprocess.TimeoutExpired as exc:
         raise EmulatorSupportError("adb start-server timed out during recovery") from exc
-    if ":" in str(device or ""):
-        try:
-            run_adb(adb_path, ["connect", device], timeout=10)
-        except subprocess.TimeoutExpired as exc:
-            raise EmulatorSupportError(f"adb connect timed out during recovery for {device}") from exc
     if device:
         try:
             run_adb(adb_path, ["wait-for-device"], device=device, timeout=20)

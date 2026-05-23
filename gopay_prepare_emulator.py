@@ -343,6 +343,42 @@ def enable_bluestacks_adb(args: argparse.Namespace, logger: logging.Logger, inst
     )
 
 
+def set_bluestacks_display_config(
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    instance_name: str,
+) -> None:
+    name = str(instance_name or "").strip()
+    if not name:
+        return
+    try:
+        conf_path = emulator_support.bluestacks_conf_path(args.bs_dir)
+    except emulator_support.EmulatorSupportError as exc:
+        raise PrepareError(str(exc)) from exc
+    updates = {
+        f"bst.instance.{name}.fb_width": str(int(args.width)),
+        f"bst.instance.{name}.fb_height": str(int(args.height)),
+        f"bst.instance.{name}.dpi": str(int(args.dpi)),
+        f"bst.instance.{name}.custom_resolution_selected": "1",
+    }
+    text = conf_path.read_text(encoding="utf-8", errors="replace")
+    for key, value in updates.items():
+        line = f'{key}="{value}"'
+        pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
+        if pattern.search(text):
+            text = pattern.sub(line, text)
+        else:
+            text = text.rstrip() + "\n" + line + "\n"
+    conf_path.write_text(text, encoding="utf-8")
+    logger.info(
+        "Set BlueStacks config instance=%s resolution=%sx%s dpi=%s",
+        name,
+        args.width,
+        args.height,
+        args.dpi,
+    )
+
+
 def ensure_bluestacks_instance(args: argparse.Namespace, logger: logging.Logger) -> emulator_support.BlueStacksInstance:
     requested = bool(str(args.name or "").strip() or str(args.index or "").strip())
     instance = None if (args.create and not requested) else emulator_support.find_bluestacks_instance(args.name, bs_dir=args.bs_dir, index=args.index)
@@ -459,6 +495,7 @@ def prepare_adb_emulator(args: argparse.Namespace, logger: logging.Logger) -> di
         bs_instance: emulator_support.BlueStacksInstance | None = None
         if emulator == "bluestacks":
             bs_instance = ensure_bluestacks_instance(args, logger)
+            set_bluestacks_display_config(args, logger, bs_instance.name)
             if bs_instance.connect_serial and not device_hint:
                 device_hint = bs_instance.connect_serial
             if not args.no_launch:
@@ -490,15 +527,18 @@ def prepare_adb_emulator(args: argparse.Namespace, logger: logging.Logger) -> di
         if "Success" not in out:
             logger.warning("MT Manager install did not print Success: %s", out[:300])
 
-    logger.info("Pushing GoPay APKS to /sdcard/Pictures/")
-    adb_check(adb_path, device, ["shell", "mkdir -p /sdcard/Pictures"], logger, timeout=30)
-    adb_check(
-        adb_path,
-        device,
-        ["push", str(gopay_apks), f"/sdcard/Pictures/{gopay_apks.name}"],
-        logger,
-        timeout=240,
-    )
+    if emulator == "bluestacks" and not args.open_mt:
+        logger.info("Skipping GoPay APKS push for BlueStacks; installing host split APKs directly")
+    else:
+        logger.info("Pushing GoPay APKS to /sdcard/Pictures/")
+        adb_check(adb_path, device, ["shell", "mkdir -p /sdcard/Pictures"], logger, timeout=30)
+        adb_check(
+            adb_path,
+            device,
+            ["push", str(gopay_apks), f"/sdcard/Pictures/{gopay_apks.name}"],
+            logger,
+            timeout=240,
+        )
 
     suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", device or emulator)
     install_gopay_splits_adb(adb_path, device, gopay_apks, logger, suffix)
